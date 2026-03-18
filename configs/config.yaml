@@ -1,0 +1,42 @@
+# agent_UAV configuration
+
+# Volcano Engine LLM (火山方舟 Ark) settings
+llm:
+  # API key – set via VOLC_ACCESSKEY env var or fill in here (keep secret!)
+  api_key: "${VOLC_ACCESSKEY}"
+  # Endpoint ID (Doubao model deployment ID from Volcano Ark console)
+  endpoint_id: "${VOLC_ENDPOINT_ID}"
+  base_url: "https://ark.cn-beijing.volces.com/api/v3"
+  model: "doubao-pro-32k"
+  max_tokens: 2048
+  temperature: 0.2
+
+# MAVLink connection
+mavlink:
+  # Use "udp:127.0.0.1:14550" for SITL (ArduPilot/PX4 via MAVProxy)
+  # Use "serial:/dev/ttyACM0:57600" for real hardware
+  connection_string: "udp:127.0.0.1:14550"
+  timeout: 30          # seconds to wait for heartbeat
+  baud_rate: 57600
+
+# Grounding DINO
+grounding_dino:
+  # Model weights; downloaded automatically on first run
+  config_path: "groundingdino/config/GroundingDINO_SwinT_OGC.py"
+  weights_path: "weights/groundingdino_swint_ogc.pth"
+  box_threshold: 0.35
+  text_threshold: 0.25
+  device: "cpu"        # "cuda" if GPU is available
+
+# UAV control parameters
+uav:
+  default_altitude: 5.0        # metres
+  default_airspeed: 3.0        # m/s
+  hover_duration: 3.0          # seconds
+  max_altitude: 50.0           # metres (safety ceiling)
+  arm_timeout: 15              # seconds
+
+# Agent
+agent:
+  max_steps: 20
+  verbose: true

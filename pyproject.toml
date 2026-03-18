@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=67"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent_uav"
+version = "0.1.0"
+description = "Closed-loop UAV simulation: natural language → LLM → MAVLink → Grounding DINO"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+    "pymavlink>=2.4.41",
+    "smolagents>=1.0.0",
+    "volcengine-python-sdk[ark]>=1.0.0",
+    "numpy>=1.24.0",
+    "Pillow>=9.5.0",
+    "pyyaml>=6.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-mock>=3.11.0",
+]
+gpu = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "supervision>=0.16.0",
+    "transformers>=4.35.0",
+]
+
+[project.scripts]
+agent-uav = "src.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
