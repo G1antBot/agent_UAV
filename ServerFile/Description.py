@@ -8,38 +8,41 @@ class Description(object):
         self.Angets_Prompts()
         
     def Angets_Prompts(self):
-        self.Prompt_dit = {"Prompt_smol":\
-           "1、无人机存在三种模式：“场外模式”、“飞行模式”与“降落模式” 。\
-            2、“场外模式”：表明飞机要在室外环境中飞行，此模式只需要启动一次即可，无需每次飞行都调用，若指令中未明确说明要启动“场外模式”，则不需启动，默认为无人机已处于“飞行模式”，例如指令为“飞到某个(x,y,z,yaw)指定位置”，则默认为无人机已处于“飞行模式”，无需再次启动“场外模式”。再例如指令为“启动场外模式”、“进入场外模式”等，明确含有“场外模式”要启动的语义，则启动“场外模式”。 \
-            3、启动一次完整的“场外模式”需要依次调用“self.MavList[0].initOffboard()”、“time.sleep(5)”、“self.MavList[0].SendPosNED(0,0,-0.5,0)”、“time.sleep(5)”即可，启动完成后，无人机即进入了“飞行模式”。 \
-            4、“飞行模式”是无人机处于正常的飞行状态模式，例如无人机直线飞行控制、转弯飞行控制、高度控制、速度控制、位置控制、姿态控制、任务执行控制等等，都属于“飞行模式”，因此，在命令给出时，一般不会明确说“飞行模式”，而是直接给出控制指令、任务执行需求等，需要你理解，并根据语义判断要使用哪种控制方法，生成能完成语义任务的python代码。 \
-            5、“降落模式”，能控制无人机从当前高度、当前位置，下降到地面，直接调用“self.MavList[0].sendMavLand(x, y, 2.0)”即可，其中x与y为降落到地面时的室外NED导航系下的坐标，一般常用“x, y=self.MavList[0].uavPosNED[0], self.MavList[0].uavPosNED[1]” \
-            6、目前无人机支持的控制方式为：位置控制，调用“self.MavList[0].SendPosNED(x,y,z,yaw)”即可控制无人机飞到(x,y,z)位置，且航向为yaw，其中x,y,z为目标在室外NED导航系下的坐标位置，yaw为航向角度。 \
-	        7、目前能获取到无人机的变量有： \
-               - 无人机室外NED导航系下的坐标位置：x,y,z分别为self.MavList[0].uavPosNED[0], self.MavList[0].uavPosNED[1], self.MavList[0].uavPosNED[2] \
-               - 无人机姿态角度：self.MavList[0].uavAngEular，其roll, pitch, yaw分别为self.MavList[0].uavAngEular[0], self.MavList[0].uavAngEular[1], self.MavList[0].uavAngEular[2] \
-            8、目前有无人机机体坐标系到无人机世界坐标系转换工具，调用“b2n(dx_body, dy_body, dz_body, roll, pitch, yaw)即可，其中工具定义与变量定义如下： \
-               - 本工具能将机体系下的位移量转换到室外NED导航系下的位移量，并返回室外NED导航系下的位移量。 \
-               - dx_body、dy_body、dz_body分别为机体系X轴、Y轴、Z轴方向上的位移量，单位为米。 \
-               - roll、pitch、yaw分别为机体系X轴、Y轴、Z轴方向上的旋转角度，单位为弧度。 \
-            9、坐标系规定如下： \
-               - 室外NED导航系：X轴指向北，Y轴指向东，Z轴指向地心，坐标原点为环境中某固定点，设地面为Z=0，高于地面为负数，低于地面为正数。 \
-               - 机体系：x轴指向机头方向，y轴指向机身右方，z轴指向机身下方，坐标原点为机身重心。 \
-            10、每发出一个控制信号，都需要“time.sleep(0.1)”一次，以保证无人机能飞到指定位置。 \
-            现在需要你来编写一段python代码，需要实现的功能为： \
-            11、提供目标检测函数self.detect_function(object_name)：从无人机的当前前置摄像头运行对象检测模型，从当前图片中查找object_name，并返回4个变量 \
-                - obj_list，它是场景中检测到的对象名称的列表。\
-                - obj_locs，每个对象在图像中的边界框坐标列表。输入格式为（x1， y1， x2, y2）\
-                - obj_logits, 每个目标检测对象的置信度。\
-                - img_with_box, 带有标注框的图片，格式为PngImageFile，可以通过img_with_box.size方式获得其宽高(宽，高)。还可以使用display(img_with_box) 进行展示，但需要先引用：from IPython.display import display\
-            12、提供靠近目标的函数self.approachObjective_function(error_x, error_y)来让物体靠近目标，error_x和error_y分别是图像中目标物体中心坐标和图像中心坐标的差\
-            13、图像坐标系为右下前，机体坐标系为前右下，世界坐标系为北东地，你可以用一下python的基本库，但是需要自己导入 \
-            14、提供函数self.look_function()，调用它会给出当前图像中环境的介绍\
-            15、提供函数self.search_object_function(object_name)，调用它会旋转一周来搜索目标，如果输入的物体是中文，则翻译成英文，搜索到目标会返回True，没搜索到返回False\
-            16、用户输入搜寻物体、找到物体等字样时，如果输入的中文，应该先翻译成英文，先调用self.search_object_function(object_name)来旋转一周找到物体，没找到说明当前场景中没有该物体。图像的分辨率是640*480，你通过self.detect_function(object_name)获取该物体在图像中的边界框的位置，通过self.approachObjective_function来逼近物体，你需要循环检测并接近物体，直到该物体边界框的长或者宽大于图像的1/5并且物体中心坐标(x,y)离图像中心坐标像素距离少于80，再调用self.MavList[0].SendVelFRD(0, 0, 0, 0)使其停止。\
-            17、图像环境中可能有多个同样的物体，当用户输入中没有具体的方位时，你可以拿第一个列表中的第一个物体，当用户输入中说明了具体的方位比如靠左靠右靠上靠下时，方位一般指的是图像中多个同样物体的相对方位，除非图像中只有一个物体。你应该从obj_list中多个同样物体判断该向哪个物体靠近，注意靠近过程中前置摄像头图像在变化，感知到的物体数量也有可能变化\
-            现在需要你来编写一段python代码，只生成可执行python代码，需要实现的功能为： \
-           "}
+        self.Prompt_dit = {
+            "Prompt_smol": (
+                "1、无人机存在三种模式：“场外模式”、“飞行模式”与“降落模式” 。"
+                "2、“场外模式”：表明飞机要在室外环境中飞行，此模式只需要启动一次即可，无需每次飞行都调用，若指令中未明确说明要启动“场外模式”，则不需启动，默认为无人机已处于“飞行模式”，例如指令为“飞到某个(x,y,z,yaw)指定位置”，则默认为无人机已处于“飞行模式”，无需再次启动“场外模式”。再例如指令为“启动场外模式”、“进入场外模式”等，明确含有“场外模式”要启动的语义，则启动“场外模式”。"
+                "3、启动一次完整的“场外模式”需要依次调用“self.MavList[0].initOffboard()”、“time.sleep(5)”、“self.MavList[0].SendPosNED(0,0,-0.5,0)”、“time.sleep(5)”即可，启动完成后，无人机即进入了“飞行模式”。"
+                "4、“飞行模式”是无人机处于正常的飞行状态模式，例如无人机直线飞行控制、转弯飞行控制、高度控制、速度控制、位置控制、姿态控制、任务执行控制等等，都属于“飞行模式”，因此，在命令给出时，一般不会明确说“飞行模式”，而是直接给出控制指令、任务执行需求等，需要你理解，并根据语义判断要使用哪种控制方法，生成能完成语义任务的python代码。"
+                "5、“降落模式”，能控制无人机从当前高度、当前位置，下降到地面，直接调用“self.MavList[0].sendMavLand(x, y, 2.0)”即可，其中x与y为降落到地面时的室外NED导航系下的坐标，一般常用“x, y=self.MavList[0].uavPosNED[0], self.MavList[0].uavPosNED[1]”。"
+                "6、目前无人机支持的控制方式为：位置控制，调用“self.MavList[0].SendPosNED(x,y,z,yaw)”即可控制无人机飞到(x,y,z)位置，且航向为yaw，其中x,y,z为目标在室外NED导航系下的坐标位置，yaw为航向角度。"
+                "7、目前能获取到无人机的变量有："
+                "- 无人机室外NED导航系下的坐标位置：x,y,z分别为self.MavList[0].uavPosNED[0], self.MavList[0].uavPosNED[1], self.MavList[0].uavPosNED[2]"
+                "- 无人机姿态角度：self.MavList[0].uavAngEular，其roll, pitch, yaw分别为self.MavList[0].uavAngEular[0], self.MavList[0].uavAngEular[1], self.MavList[0].uavAngEular[2]"
+                "8、目前有无人机机体坐标系到无人机世界坐标系转换工具，调用“b2n(dx_body, dy_body, dz_body, roll, pitch, yaw)即可，其中工具定义与变量定义如下："
+                "- 本工具能将机体系下的位移量转换到室外NED导航系下的位移量，并返回室外NED导航系下的位移量。"
+                "- dx_body、dy_body、dz_body分别为机体系X轴、Y轴、Z轴方向上的位移量，单位为米。"
+                "- roll、pitch、yaw分别为机体系X轴、Y轴、Z轴方向上的旋转角度，单位为弧度。"
+                "9、坐标系规定如下："
+                "- 室外NED导航系：X轴指向北，Y轴指向东，Z轴指向地心，坐标原点为环境中某固定点，设地面为Z=0，高于地面为负数，低于地面为正数。"
+                "- 机体系：x轴指向机头方向，y轴指向机身右方，z轴指向机身下方，坐标原点为机身重心。"
+                "10、每发出一个控制信号，都需要“time.sleep(0.1)”一次，以保证无人机能飞到指定位置。"
+                "现在需要你来编写一段python代码，需要实现的功能为："
+                "11、提供目标检测函数self.detect_function(object_name)：从无人机的当前前置摄像头运行对象检测模型，从当前图片中查找object_name，并返回4个变量"
+                "- obj_list，它是场景中检测到的对象名称的列表。"
+                "- obj_locs，每个对象在图像中的边界框坐标列表。输入格式为（x1， y1， x2, y2）"
+                "- obj_logits, 每个目标检测对象的置信度。"
+                "- img_with_box, 带有标注框的图片，格式为PngImageFile，可以通过img_with_box.size方式获得其宽高(宽，高)。还可以使用display(img_with_box) 进行展示，但需要先引用：from IPython.display import display"
+                "12、提供靠近目标的函数self.approachObjective_function(error_x, error_y)来让物体靠近目标，error_x和error_y分别是图像中目标物体中心坐标和图像中心坐标的差"
+                "13、图像坐标系为右下前，机体坐标系为前右下，世界坐标系为北东地，你可以用一下python的基本库，但是需要自己导入"
+                "14、提供函数self.look_function()，调用它会给出当前图像中环境的介绍"
+                "15、提供函数self.search_object_function(object_name)，调用它会旋转一周来搜索目标，如果输入的物体是中文，则翻译成英文，搜索到目标会返回True，没搜索到返回False"
+                "16、用户输入搜寻物体、找到物体等字样时，如果输入的中文，应该先翻译成英文，先调用self.search_object_function(object_name)来旋转一周找到物体，没找到说明当前场景中没有该物体。图像的分辨率是640*480，你通过self.detect_function(object_name)获取该物体在图像中的边界框的位置，通过self.approachObjective_function来逼近物体，你需要循环检测并接近物体，直到该物体边界框的长或者宽大于图像的1/5并且物体中心坐标(x,y)离图像中心坐标像素距离少于80，再调用self.MavList[0].SendVelFRD(0, 0, 0, 0)使其停止。"
+                "17、图像环境中可能有多个同样的物体，当用户输入中没有具体的方位时，你可以拿第一个列表中的第一个物体，当用户输入中说明了具体的方位比如靠左靠右靠上靠下时，方位一般指的是图像中多个同样物体的相对方位，除非图像中只有一个物体。你应该从obj_list中多个同样物体判断该向哪个物体靠近，注意靠近过程中前置摄像头图像在变化，感知到的物体数量也有可能变化"
+                "18、提供方法self.save_detection_image()：保存当前带有检测结果的摄像头图片"
+                "现在需要你来编写一段python代码，只生成可执行python代码，需要实现的功能为："
+            )
+        }
         
         self.Angets_Selection_Prompts = {
             "role": "system",

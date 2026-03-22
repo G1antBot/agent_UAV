@@ -2,6 +2,8 @@
 import cv2
 import numpy as np
 import time
+import sys
+sys.path.append(r"D:\Rflysim\RflySimAPIs\RflySimSDK\vision")
 import VisionCaptureApi
 import PX4MavCtrlV4 as PX4MavCtrl
 import ReqCopterSim
@@ -10,9 +12,7 @@ import base64
 import torch
 from PIL import Image
 from torchvision.ops import box_convert
-
-from groundingdino.util.inference import load_model, load_image, predict, annotate
-import groundingdino.datasets.transforms as T
+from ultralytics import YOLOE
 
 from PIL import Image
 
@@ -29,6 +29,7 @@ class BodyCommMavlink(object):
             print("use_cpu")
             self.is_cup = True
 
+
         # 初始化火山引擎LLM客户端
         api_key = "24572520-5c64-4470-8c3d-5ecb84781725"
         self.llm_client = OpenAI(
@@ -36,11 +37,10 @@ class BodyCommMavlink(object):
             base_url="https://ark.cn-beijing.volces.com/api/v3 ",
         )
 
-        # 加载Grounding DINO模型
-        self.dino_model = load_model("groundingdino/config/GroundingDINO_SwinT_OGC.py",
-                                     "groundingdino/groundingdino_swint_ogc.pth")
-        self.BOX_TRESHOLD = 0.25  # 目标检测的框阈值
-        self.TEXT_TRESHOLD = 0.15  # 文本阈值
+        # 加载YOLOE模型
+        self.yolo_model = YOLOE("i:/drone_project/实验6-7_无人机视觉语言控制实验/1.软件在环实验/ServerFile/weights/best.pt")
+        self.CONF_THRESHOLD = 0.25  # 置信度阈值
+        self.NMS_THRESHOLD = 0.45   # NMS阈值
 
         # 初始化ReqCopterSim实例，用于与模拟器通信
         self.req = ReqCopterSim.ReqCopterSim()
@@ -85,50 +85,21 @@ class BodyCommMavlink(object):
         # 返回无人机列表、无人机数量和坐标偏移量
         return self.MavList, self.VehilceNum, self.Error2UE4Map
 
-    def detect_dino(self, object_names):
-        # 使用Grounding DINO模型进行目标检测
-        IMAGE_PATH = ".asset/cats.png"
-        transform = T.Compose(
-            [
-                T.RandomResize([800], max_size=1333),
-                T.ToTensor(),
-                T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            ]
-        )
-
-        # 获取前置摄像头的图像
+    def detect_yolo(self, object_names):
+        # 使用YOLO模型进行目标检测
         image = self.vis.Img[0].copy()
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = self.yolo_model.track(image, conf=self.CONF_THRESHOLD, save=False)
 
-        # 将图像转换为PIL格式
-        image_source = Image.fromarray(image)
+        if not results:
+            print("[warn] 未获得推理结果")
+            return [], [], [], None
 
-        # 应用图像变换
-        image_transformed, _ = transform(image_source, None)
+        # 解析检测结果
+        obj_list = [result.name for result in results]  # 检测到的目标名称
+        obj_locs = [result.boxes.tolist() for result in results]  # 边界框坐标
+        obj_logits = [result.conf for result in results]  # 置信度分数
+        img_with_box = results[0].plot(masks=False)  # 带标注框的图像
 
-        # 目标检测
-        TEXT_PROMPT = object_names
-        boxes, logits, phrases = predict(
-            model=self.dino_model,
-            image=image_transformed,
-            caption=TEXT_PROMPT,
-            box_threshold=self.BOX_TRESHOLD,
-            text_threshold=self.TEXT_TRESHOLD,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        )
-
-        # 标注检测结果
-        annotated_frame = annotate(image_source=image, boxes=boxes, logits=logits, phrases=phrases)
-        cv2.imwrite("annotated_image.jpg", annotated_frame)
-
-        # 返回检测结果
-        obj_list = phrases  # 使用预测的短语作为对象列表
-        h, w, _ = image.shape
-        boxes = boxes * torch.Tensor([w, h, w, h])
-        boxes = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
-        obj_locs = boxes.tolist()  # 转换为Python列表
-        obj_logits = logits.tolist()
-        img_with_box = Image.fromarray(annotated_frame)  # 转换为PIL格式
         return obj_list, obj_locs, obj_logits, img_with_box
 
     def search_object(self, object_names):
@@ -145,7 +116,7 @@ class BodyCommMavlink(object):
             time.sleep(2)
 
             # 检测目标
-            obj_list, obj_locs, obj_logits, img_with_box = self.detect_dino(object_names)
+            obj_list, obj_locs, obj_logits, img_with_box = self.detect_yolo(object_names)
             if object_names in obj_list:
                 print(object_names, " found during rotation.")
                 return True
@@ -421,3 +392,22 @@ class BodyCommMavlink(object):
                     self.MavList[0].SendVelFRD(0, 0, 0, 0)
                 s["last_cmd"] = smooth_cmd
             s["next_ok_ts"] = t + s["hold_sec"]
+
+    def save_detection_image(self):
+        """
+        保存当前带有检测结果的摄像头图片。
+        """
+        # 调用检测函数，获取检测结果
+        results = self.detect_yolo("")
+
+        if results:
+            # 获取带有检测框的图片
+            img_with_box = results[3]
+            if img_with_box is not None:
+                # 保存图片
+                img_with_box.save("current_detection.png")
+                print("当前检测图片已保存为current_detection.png")
+            else:
+                print("未能生成带有检测框的图片。")
+        else:
+            print("未检测到任何结果，无法保存图片。")

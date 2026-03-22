@@ -205,3 +205,19 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# VS Code
+.vscode/
+
+# Windows thumbnail cache
+Thumbs.db
+
+# Word temporary files
+~$*
+
+# Large model files
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
