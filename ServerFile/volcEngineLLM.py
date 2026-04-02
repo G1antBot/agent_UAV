@@ -1,5 +1,6 @@
 import requests
 import re
+from runtime_logger import get_runtime_logger
 
 
 class VolcEngineFakeHFModel:
@@ -8,6 +9,25 @@ class VolcEngineFakeHFModel:
         self.api_key = "24572520-5c64-4470-8c3d-5ecb84781725"  # 火山引擎API密钥
         self.api_url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"  # 火山引擎API地址
         self.model_id = "deepseek-v3-250324"  # 使用的模型ID
+        self.logger = get_runtime_logger("llm")
+
+    def _normalize_code(self, text: str) -> str:
+        """
+        统一提取可执行Python代码，兼容<code>与```python两种包裹格式。
+        """
+        code = text.strip()
+
+        # 先剥离 <code>...</code>
+        code_tag_match = re.search(r"<code>\s*([\s\S]*?)\s*</code>", code, flags=re.IGNORECASE)
+        if code_tag_match:
+            code = code_tag_match.group(1).strip()
+
+        # 再剥离 ```python ... ```
+        fence_match = re.search(r"```(?:python)?\s*([\s\S]*?)\s*```", code, flags=re.IGNORECASE)
+        if fence_match:
+            code = fence_match.group(1).strip()
+
+        return code
 
     def generate(self, messages, **kwargs):
         # 将传入的消息对象序列化为字典格式，因为API需要这种格式
@@ -27,6 +47,7 @@ class VolcEngineFakeHFModel:
                 self.total_tokens = 0  # 总token数量
 
         try:
+            self.logger.info(f"请求火山方舟模型: model={self.model_id}, messages={len(serialized_messages)}")
             # 发送POST请求到API
             response = requests.post(self.api_url, headers=headers, json=payload)
             response.encoding = 'utf-8'  # 设置响应编码为UTF-8
@@ -34,13 +55,9 @@ class VolcEngineFakeHFModel:
 
             # 解析响应内容，获取生成的消息内容
             raw_content = response.json()["choices"][0]["message"]["content"]
-
-            # 使用正则表达式提取代码块内容，去除其他说明性文字
-            code_match = re.search(r"<code>(.*?)</code>", raw_content, re.DOTALL)
-            if code_match:
-                code = code_match.group(1).strip()  # 如果找到代码块，提取并去除首尾空格
-            else:
-                code = raw_content.strip()  # 如果没有代码块，直接使用原始内容并去除首尾空格
+            code = self._normalize_code(raw_content)
+            self.logger.info("火山方舟响应成功")
+            self.logger.debug(f"归一化代码预览: {code[:200]}")
 
             # 定义一个模拟的消息类，用于返回处理后的消息内容
             class FakeMessage:
@@ -54,6 +71,7 @@ class VolcEngineFakeHFModel:
         except Exception as e:
             # 如果API调用失败，打印错误信息
             print(f"火山方舟 API 调用失败: {e}")
+            self.logger.error(f"火山方舟 API 调用失败: {e}")
 
             # 定义一个模拟的消息类，用于返回失败的响应
             class FakeMessage:

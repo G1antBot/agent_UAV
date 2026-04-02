@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import time
 import sys
+import os
 sys.path.append(r"D:\Rflysim\RflySimAPIs\RflySimSDK\vision")
 import VisionCaptureApi
 import PX4MavCtrlV4 as PX4MavCtrl
@@ -17,10 +18,13 @@ from ultralytics import YOLOE
 from PIL import Image
 
 import math
+from datetime import datetime
+from runtime_logger import get_runtime_logger
 
 
 class BodyCommMavlink(object):
     def __init__(self):
+        self.logger = get_runtime_logger("comm")
         # 检查是否使用GPU
         if torch.cuda.is_available():
             print("use_gpu")
@@ -28,6 +32,7 @@ class BodyCommMavlink(object):
         else:
             print("use_cpu")
             self.is_cup = True
+        self.logger.info(f"通信模块启动, is_cpu={self.is_cup}")
 
 
         # 初始化火山引擎LLM客户端
@@ -41,6 +46,10 @@ class BodyCommMavlink(object):
         self.yolo_model = YOLOE("i:/drone_project/实验6-7_无人机视觉语言控制实验/1.软件在环实验/ServerFile/weights/best.pt")
         self.CONF_THRESHOLD = 0.25  # 置信度阈值
         self.NMS_THRESHOLD = 0.45   # NMS阈值
+        self.last_detection_image = None
+        self.last_detection_time = None
+        self.last_detection_has_object = False
+        self.logger.info("YOLOE模型加载完成")
 
         # 初始化ReqCopterSim实例，用于与模拟器通信
         self.req = ReqCopterSim.ReqCopterSim()
@@ -87,23 +96,66 @@ class BodyCommMavlink(object):
 
     def detect_yolo(self, object_names):
         # 使用YOLO模型进行目标检测
+        start_ts = time.time()
         image = self.vis.Img[0].copy()
         results = self.yolo_model.track(image, conf=self.CONF_THRESHOLD, save=False)
 
         if not results:
             print("[warn] 未获得推理结果")
-            return [], [], [], None
+            self.last_detection_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            self.last_detection_time = datetime.now()
+            self.last_detection_has_object = False
+            self.logger.warning(f"detect_yolo无推理结果, target={object_names}")
+            return [], [], [], self.last_detection_image
 
         # 解析检测结果
-        obj_list = [result.name for result in results]  # 检测到的目标名称
-        obj_locs = [result.boxes.tolist() for result in results]  # 边界框坐标
-        obj_logits = [result.conf for result in results]  # 置信度分数
-        img_with_box = results[0].plot(masks=False)  # 带标注框的图像
+        result = results[0]
+        boxes = result.boxes
+        names = result.names if hasattr(result, "names") else {}
+        obj_list, obj_locs, obj_logits = [], [], []
+        target_name = (object_names or "").strip().lower()
+
+        if boxes is not None and len(boxes) > 0:
+            cls_ids = boxes.cls.detach().cpu().numpy().astype(int).tolist() if boxes.cls is not None else []
+            confs = boxes.conf.detach().cpu().numpy().tolist() if boxes.conf is not None else []
+            locs = boxes.xyxy.detach().cpu().numpy().tolist() if boxes.xyxy is not None else []
+
+            for idx, cls_id in enumerate(cls_ids):
+                if isinstance(names, dict):
+                    obj_name = names.get(cls_id, str(cls_id))
+                elif isinstance(names, list) and 0 <= cls_id < len(names):
+                    obj_name = names[cls_id]
+                else:
+                    obj_name = str(cls_id)
+                # 当指定了目标名称时，仅返回匹配目标
+                if target_name and str(obj_name).strip().lower() != target_name:
+                    continue
+                obj_list.append(obj_name)
+                obj_locs.append(locs[idx] if idx < len(locs) else [])
+                obj_logits.append(float(confs[idx]) if idx < len(confs) else 0.0)
+
+        plot_bgr = result.plot(masks=False)  # 带标注框的图像（BGR ndarray）
+        img_with_box = Image.fromarray(cv2.cvtColor(plot_bgr, cv2.COLOR_BGR2RGB))
+
+        # 缓存最近一次检测可视化图，供保存函数直接使用
+        self.last_detection_image = img_with_box
+        self.last_detection_time = datetime.now()
+        self.last_detection_has_object = len(obj_list) > 0
+
+        cost_ms = (time.time() - start_ts) * 1000.0
+        self.logger.info(
+            f"detect_yolo target={object_names} matched={len(obj_list)} elapsed_ms={cost_ms:.1f}"
+        )
+        if obj_list:
+            self.logger.info(
+                f"detect_detail names={obj_list} locs={obj_locs} confs={[round(v, 3) for v in obj_logits]}"
+            )
 
         return obj_list, obj_locs, obj_logits, img_with_box
 
     def search_object(self, object_names):
         # 通过旋转无人机的偏航角搜索目标
+        self.logger.info(f"开始搜索目标: {object_names}")
         current_yaw = self.MavList[0].uavAngEular[2]
         for yaw_step in range(0, 360, 40):
             new_yaw = current_yaw + (yaw_step * 3.14159 / 180)  # 转换为弧度
@@ -117,9 +169,12 @@ class BodyCommMavlink(object):
 
             # 检测目标
             obj_list, obj_locs, obj_logits, img_with_box = self.detect_yolo(object_names)
+            self.logger.info(f"search_step yaw_step={yaw_step} found={object_names in obj_list}")
             if object_names in obj_list:
                 print(object_names, " found during rotation.")
+                self.logger.info(f"搜索成功: {object_names}")
                 return True
+        self.logger.info(f"搜索失败: {object_names}")
         return False
 
     def cv2_to_base64(self, image, format='.png'):
@@ -132,6 +187,7 @@ class BodyCommMavlink(object):
 
     def look(self):
         # 获取前置摄像头的图像，并通过火山引擎LLM进行图像理解
+        self.logger.info("调用look_function进行视觉描述")
         rgb_image = self.vis.Img[0]
         base64_str = self.cv2_to_base64(rgb_image, ".png")
         response = self.llm_client.chat.completions.create(
@@ -154,6 +210,7 @@ class BodyCommMavlink(object):
             temperature=0.01
         )
         content = response.choices[0].message.content
+        self.logger.info(f"look_function返回: {str(content)[:120]}")
         return content
 
 
@@ -251,6 +308,9 @@ class BodyCommMavlink(object):
         s["lp_ey"] = lowpass(s["lp_ey"], error_y, dt, s["tau_err"])  # 低通滤波处理Y方向误差
         ex = deadband(s["lp_ex"], s["db_x"])  # 应用死区处理X方向误差
         ey = deadband(s["lp_ey"], s["db_y"])  # 应用死区处理Y方向误差
+        self.logger.info(
+            f"approach_loop error=({error_x:.2f},{error_y:.2f}) lp=({s['lp_ex']:.2f},{s['lp_ey']:.2f}) phase={s['phase']}"
+        )
 
         # ---------------- 到达统计 ----------------
         if abs(s["lp_ex"]) <= s["hit_x"] and abs(s["lp_ey"]) <= s["hit_y"]:
@@ -322,6 +382,7 @@ class BodyCommMavlink(object):
                 # print("phase:", s["phase"], "cmd:", smooth_cmd)  # 如需调试可打开
                 if smooth_cmd != s["last_cmd"]:
                     self.MavList[0].SendVelFRD(*smooth_cmd)
+                    self.logger.info(f"approach_cmd cmd={tuple(round(v, 4) for v in smooth_cmd)}")
                     if self.is_cup:
                         #使用cpu的时候检测一帧图像要2s-3s，要一步一步的靠近气球
                         time.sleep(1.0)
@@ -393,21 +454,63 @@ class BodyCommMavlink(object):
                 s["last_cmd"] = smooth_cmd
             s["next_ok_ts"] = t + s["hold_sec"]
 
-    def save_detection_image(self):
+    def save_detection_image(self, output_dir=None, file_name=None, use_latest=False):
         """
-        保存当前带有检测结果的摄像头图片。
+        保存带有检测结果的摄像头图片。
+        默认实时触发一次检测并保存；
+        当use_latest=True时优先保存最近一次检测缓存图（若缓存为空则自动触发一次检测）。
+        :return: 保存成功返回文件路径，失败返回None。
         """
-        # 调用检测函数，获取检测结果
-        results = self.detect_yolo("")
+        img_with_box = None
 
-        if results:
-            # 获取带有检测框的图片
-            img_with_box = results[3]
-            if img_with_box is not None:
-                # 保存图片
-                img_with_box.save("current_detection.png")
-                print("当前检测图片已保存为current_detection.png")
-            else:
-                print("未能生成带有检测框的图片。")
+        has_object = False
+
+        if use_latest and self.last_detection_image is not None:
+            img_with_box = self.last_detection_image
+            has_object = bool(self.last_detection_has_object)
+            self.logger.info("save_detection_image使用缓存检测图")
         else:
-            print("未检测到任何结果，无法保存图片。")
+            obj_list, _, _, img_with_box = self.detect_yolo("")
+            has_object = len(obj_list) > 0
+            self.logger.info("save_detection_image实时触发检测")
+
+        if img_with_box is None:
+            # 无检测结果时仍保存当前原图（需求2.A）
+            img_with_box = self.vis.Img[0].copy()
+            has_object = False
+
+        if output_dir is None:
+            output_dir = os.path.join(os.path.dirname(__file__), "saved_detections")
+        os.makedirs(output_dir, exist_ok=True)
+
+        if file_name is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_name = f"detection_{timestamp}.png"
+
+        file_path = os.path.join(output_dir, file_name)
+
+        try:
+            if isinstance(img_with_box, np.ndarray):
+                ok = cv2.imwrite(file_path, img_with_box)
+                if not ok:
+                    print(f"保存失败：cv2.imwrite返回False，路径={file_path}")
+                    self.logger.error(f"保存失败: cv2.imwrite返回False, path={file_path}")
+                    return None
+            elif isinstance(img_with_box, Image.Image):
+                img_with_box.save(file_path)
+            else:
+                print(f"保存失败：不支持的图像类型 {type(img_with_box)}")
+                self.logger.error(f"保存失败: 不支持图像类型 {type(img_with_box)}")
+                return None
+        except Exception as e:
+            print(f"保存失败：{e}")
+            self.logger.error(f"保存失败: {e}")
+            return None
+
+        if has_object:
+            print(f"检测结果图片已保存：{file_path}")
+            self.logger.info(f"保存成功(含目标): {file_path}")
+        else:
+            print(f"未检测到目标，已保存当前摄像头图片：{file_path}")
+            self.logger.info(f"保存成功(无目标): {file_path}")
+        return file_path

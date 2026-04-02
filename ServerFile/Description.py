@@ -39,7 +39,8 @@ class Description(object):
                 "15、提供函数self.search_object_function(object_name)，调用它会旋转一周来搜索目标，如果输入的物体是中文，则翻译成英文，搜索到目标会返回True，没搜索到返回False"
                 "16、用户输入搜寻物体、找到物体等字样时，如果输入的中文，应该先翻译成英文，先调用self.search_object_function(object_name)来旋转一周找到物体，没找到说明当前场景中没有该物体。图像的分辨率是640*480，你通过self.detect_function(object_name)获取该物体在图像中的边界框的位置，通过self.approachObjective_function来逼近物体，你需要循环检测并接近物体，直到该物体边界框的长或者宽大于图像的1/5并且物体中心坐标(x,y)离图像中心坐标像素距离少于80，再调用self.MavList[0].SendVelFRD(0, 0, 0, 0)使其停止。"
                 "17、图像环境中可能有多个同样的物体，当用户输入中没有具体的方位时，你可以拿第一个列表中的第一个物体，当用户输入中说明了具体的方位比如靠左靠右靠上靠下时，方位一般指的是图像中多个同样物体的相对方位，除非图像中只有一个物体。你应该从obj_list中多个同样物体判断该向哪个物体靠近，注意靠近过程中前置摄像头图像在变化，感知到的物体数量也有可能变化"
-                "18、提供方法self.save_detection_image()：保存当前带有检测结果的摄像头图片"
+                "18、提供方法self.save_detection_image()：实时触发一次目标检测并保存当前检测结果图；若当前未检测到目标，也要保存当前摄像头图"
+                "19、提供方法self.save_latest_detection_image()：保存最近一次检测缓存图；若缓存为空则自动触发一次检测后保存"
                 "现在需要你来编写一段python代码，只生成可执行python代码，需要实现的功能为："
             )
         }
