@@ -28,7 +28,8 @@ if __name__ == '__main__':
         Comm_api.approachObjective,  # 接近目标函数
         Comm_api.look,  # 前置摄像头图像处理函数
         Comm_api.search_object,  # 搜索目标函数
-        Comm_api.save_detection_image  # 保存检测结果图函数
+        Comm_api.save_detection_image,  # 保存检测结果图函数
+        Comm_api.face_objective_to_target  # 原地朝向目标函数
     )
     # 启动主控制逻辑，用户可以通过自然语言输入指令，模型生成相应的控制代码并执行
     logger.info("进入主控制循环")

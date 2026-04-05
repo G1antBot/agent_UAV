@@ -18,6 +18,7 @@ from ultralytics import YOLOE
 from PIL import Image
 
 import math
+import traceback
 from datetime import datetime
 from runtime_logger import get_runtime_logger
 
@@ -90,6 +91,28 @@ class BodyCommMavlink(object):
                 ])
             ]
 
+    def _canonical_object_name(self, object_name):
+        """
+        将常见中文目标名归一化到检测模型使用的英文类别名。
+        """
+        if object_name is None:
+            return ""
+        name = str(object_name).strip().lower()
+        if not name:
+            return ""
+
+        alias_map = {
+            "蓝色小球": "blue ball",
+            "蓝球": "blue ball",
+            "蓝色球": "blue ball",
+            "红色气球": "red balloon",
+            "红气球": "red balloon",
+            "红色球": "red balloon",
+            "无人机": "uav",
+            "飞机": "airplane",
+        }
+        return alias_map.get(name, name)
+
     def GetBodyMavList(self):
         # 返回无人机列表、无人机数量和坐标偏移量
         return self.MavList, self.VehilceNum, self.Error2UE4Map
@@ -113,7 +136,7 @@ class BodyCommMavlink(object):
         boxes = result.boxes
         names = result.names if hasattr(result, "names") else {}
         obj_list, obj_locs, obj_logits = [], [], []
-        target_name = (object_names or "").strip().lower()
+        target_name = self._canonical_object_name(object_names)
 
         if boxes is not None and len(boxes) > 0:
             cls_ids = boxes.cls.detach().cpu().numpy().astype(int).tolist() if boxes.cls is not None else []
@@ -155,7 +178,8 @@ class BodyCommMavlink(object):
 
     def search_object(self, object_names):
         # 通过旋转无人机的偏航角搜索目标
-        self.logger.info(f"开始搜索目标: {object_names}")
+        canonical_name = self._canonical_object_name(object_names)
+        self.logger.info(f"开始搜索目标: {object_names} -> {canonical_name}")
         current_yaw = self.MavList[0].uavAngEular[2]
         for yaw_step in range(0, 360, 40):
             new_yaw = current_yaw + (yaw_step * 3.14159 / 180)  # 转换为弧度
@@ -168,13 +192,14 @@ class BodyCommMavlink(object):
             time.sleep(2)
 
             # 检测目标
-            obj_list, obj_locs, obj_logits, img_with_box = self.detect_yolo(object_names)
-            self.logger.info(f"search_step yaw_step={yaw_step} found={object_names in obj_list}")
-            if object_names in obj_list:
-                print(object_names, " found during rotation.")
-                self.logger.info(f"搜索成功: {object_names}")
+            obj_list, obj_locs, obj_logits, img_with_box = self.detect_yolo(canonical_name)
+            found = len(obj_list) > 0
+            self.logger.info(f"search_step yaw_step={yaw_step} found={found}")
+            if found:
+                print(canonical_name, " found during rotation.")
+                self.logger.info(f"搜索成功: {canonical_name}")
                 return True
-        self.logger.info(f"搜索失败: {object_names}")
+        self.logger.info(f"搜索失败: {canonical_name}")
         return False
 
     def cv2_to_base64(self, image, format='.png'):
@@ -453,6 +478,86 @@ class BodyCommMavlink(object):
                     self.MavList[0].SendVelFRD(0, 0, 0, 0)
                 s["last_cmd"] = smooth_cmd
             s["next_ok_ts"] = t + s["hold_sec"]
+
+    def face_objective_to_target(self, object_names, max_seconds=15.0, align_tol=25.0, stable_need=3):
+        """
+        原地转向对准目标，不前进。
+        先搜索目标，再根据图像中心偏差调用 faceObjectiveOnly 做原地转向。
+        """
+        if not object_names:
+            print("执行失败：目标名称不能为空")
+            self.logger.warning("face_objective_to_target拒绝执行: 目标名称为空")
+            return False
+
+        canonical_name = self._canonical_object_name(object_names)
+
+        try:
+            if not self.search_object(canonical_name):
+                print(f"执行失败：未找到目标 {object_names}")
+                self.logger.warning(f"face_objective_to_target搜索失败: {object_names} -> {canonical_name}")
+                return False
+
+            start_ts = time.monotonic()
+            stable_cnt = 0
+            last_abs_error_x = None
+
+            while True:
+                if time.monotonic() - start_ts > max_seconds:
+                    self.logger.info(
+                        f"face_objective_to_target超时退出: target={object_names} elapsed={time.monotonic() - start_ts:.2f}s"
+                    )
+                    return True
+
+                step_idx = stable_cnt + 1
+                obj_list, obj_locs, obj_logits, img_with_box = self.detect_yolo(canonical_name)
+                if not obj_list or not obj_locs:
+                    print(f"执行失败：未检测到目标 {object_names}")
+                    self.logger.warning(f"face_objective_to_target未检测到目标: {object_names} -> {canonical_name}")
+                    return False
+
+                bbox = obj_locs[0]
+                if len(bbox) < 4:
+                    print("执行失败：目标框信息不完整")
+                    self.logger.warning(f"face_objective_to_target目标框不完整: {bbox}")
+                    return False
+
+                img_w, img_h = img_with_box.size if hasattr(img_with_box, "size") else (640, 480)
+                center_x = (bbox[0] + bbox[2]) / 2.0
+                center_y = (bbox[1] + bbox[3]) / 2.0
+                error_x = center_x - img_w / 2.0
+                error_y = center_y - img_h / 2.0
+
+                print(f"[FACE] target={object_names} err=({error_x:.1f},{error_y:.1f}) stable={stable_cnt}/{stable_need}")
+                self.logger.info(
+                    f"face_objective_to_target target={object_names} err=({error_x:.1f},{error_y:.1f}) elapsed={time.monotonic() - start_ts:.2f}s stable={stable_cnt}/{stable_need}"
+                )
+
+                if abs(error_x) <= align_tol:
+                    stable_cnt += 1
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                    self.logger.info(f"face_objective_to_target命中稳定阈值: {object_names} stable={stable_cnt}/{stable_need}")
+                    if stable_cnt >= stable_need:
+                        self.logger.info(f"face_objective_to_target完成对准: {object_names}")
+                        return True
+                    time.sleep(0.1)
+                    continue
+
+                stable_cnt = 0
+
+                # 若误差在减小但还未到阈值，继续原地朝向；若误差未明显改善，也不要立刻退出，交给时间上限兜底
+                if last_abs_error_x is not None and abs(error_x) > last_abs_error_x + 15:
+                    self.logger.info(
+                        f"face_objective_to_target误差波动: last={last_abs_error_x:.1f}, now={abs(error_x):.1f}"
+                    )
+                last_abs_error_x = abs(error_x)
+
+                self.faceObjectiveOnly(error_x, error_y)
+                time.sleep(0.1)
+        except Exception as e:
+            print(f"执行失败：原地转向目标异常 {e}")
+            self.logger.error(f"face_objective_to_target执行失败: {e}")
+            self.logger.debug(traceback.format_exc())
+            return False
 
     def save_detection_image(self, output_dir=None, file_name=None, use_latest=False):
         """
