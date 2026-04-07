@@ -4,20 +4,21 @@
 
 ### 1.1 实验背景
 
-本实验利用软件在环(SIL)仿真技术研究无人机飞行控制策略。通过Python大语言模型自动代码生成对无人机进行控制，实现无人机通过自然语言指令识别不同颜色的小球并靠近的目标。
+本实验利用软件在环(SIL)仿真技术研究无人机飞行控制策略。当前项目已经完成中期版本的核心链路搭建，能够通过Python代码生成与无人机控制程序联动，实现无人机根据自然语言指令进行目标搜索、识别和逼近控制。
 
 **核心技术栈:**
 - 飞思集群仿真平台 (RflySim)
 - MAVLink通信协议
-- YOLO (目标检测)
-- SmolAgents (代码化智能体)
-- 火山引擎大语言模型 (deepseek-v3)
+- YOLOE / YOLO（目标检测）
+- SmolAgents（代码化智能体）
+- 火山引擎大语言模型（deepseek-v3）
+- runtime_logger（运行日志与调试追踪）
 
 ### 1.2 实验目标
 
-1. 理解单机控制基本概念，熟悉单机接口配置
-2. 掌握通过Python大语言模型自动生成控制指令，使无人机识别并靠近不同颜色的小球
-3. 学会使用飞思集群仿真平台完成单机软件在环仿真
+1. 完成无人机仿真环境、通信链路与坐标系的统一初始化
+2. 构建可运行的感知-决策-控制闭环，并支持自然语言任务执行
+3. 形成可用于中期检查演示的稳定版本，具备日志、检测图保存和异常调试能力
 
 ---
 
@@ -42,16 +43,32 @@
 │  无人机执行动作  │ <-- │ MAVLink通信     │ <-- │     YOLO       │
 │ (旋转、逼近目标) │     │ 获取无人机状态  │     │   目标检测      │
 └─────────────────┘     └─────────────────┘     └─────────────────┘
+                              │
+                              v
+                    ┌──────────────────┐
+                    │ runtime_logger   │
+                    │ 日志与调试追踪   │
+                    └──────────────────┘
 ```
-
+                    **功能:** 实时目标检测，通过自训练权重识别图像中的目标，并为后续控制提供稳定的结构化输出
 ### 2.2 三层架构
 
 | 层级 | 功能 | 关键组件 |
 |------|------|----------|
-| **感知层** | 获取环境和无人机状态 | MAVLink通信、YOLO目标检测、LLM图像理解 |
-| **决策层** | 将自然语言转换为控制策略 | SmolAgents框架、火山引擎LLM |
-| **控制层** | 执行具体控制指令 | PX4MavCtrl、NED坐标系位置/速度控制 |
+| **感知层** | 获取环境和无人机状态 | MAVLink通信、YOLOE目标检测、LLM图像理解、检测图缓存 |
+                    1. 从前置摄像头获取当前图像
+                    2. 使用 `YOLOE` 加载的 `weights/best.pt` 进行推理
+                    3. 按目标名称过滤结果，整理输出框坐标和置信度
+                    4. 缓存带框可视化图，供后续保存和调试使用
+| **决策层** | 将自然语言转换为控制策略 | SmolAgents CodeAgent、火山引擎LLM适配层 |
+| **控制层** | 执行具体控制指令 | PX4MavCtrl、NED坐标系位置/速度控制、两阶段伺服控制 |
+                    **输出特点:**
+                    - 支持按目标名过滤检测结果
+                    - 输出检测框、置信度和带框图像
+                    - 额外缓存最近一次检测图，便于保存和回看
 
+                    **类别到文本的映射:**
+                    由于模型输出的是类别ID，需要通过映射表转换为文本:
 ---
 
 ## 3. 核心模块详解
@@ -59,32 +76,24 @@
 ### 3.1 坐标系定义与转换
 
 **NED坐标系** (无人机本地坐标系):
-- N (North): 北向
+                    **核心功能:** 将自然语言指令转化为可执行的Python代码，并把无人机任务拆成可调用的工具链
 - E (East): 东向
 - D (Down): 向下
-
-**UE4全局坐标系** (仿真环境):
-- X: 东向
+                    - 可用函数说明: `detect_yolo()`, `approachObjective()`, `search_object()`, `look()`, `save_detection_image()`
+                    - 控制逻辑约束: 偏航对齐后逼近、误差阈值判断、搜索失败回退等
+                    - 安全保护: 目标丢失检测、超时处理、异常输入处理
 - Y: 北向
 - Z: 向上
 
 **坐标转换公式:**
-```
-Error2UE4Map = [
     -(GlobalPos_X - NED_X),  # X轴偏移
     -(GlobalPos_Y - NED_Y),  # Y轴偏移
     -(GlobalPos_Z - NED_Z)   # Z轴偏移 (注意方向相反)
 ]
 ```
 
-### 3.2 YOLO 目标检测
-
-**功能:** 实时目标检测，通过预训练模型识别图像中的目标
 
 **处理流程:**
-1. 图像预处理: 调整尺寸(640x640) -> 归一化 -> 格式转换
-2. 模型推理: 输入图像，输出边界框、类别和置信度
-3. 后处理: NMS非极大值抑制去除重叠框
 
 **关键参数:**
 ```python
@@ -159,6 +168,7 @@ ServerFile/
 ├── volcEngineLLM.py                 # 火山引擎LLM API封装
 ├── Description.py                   # 提示词模板定义
 ├── Coordinate_Transformation.py     # 坐标转换工具
+├── runtime_logger.py                # 运行日志封装
 ├── VisionCaptureApi.py              # 视觉捕获API
 ├── PX4MavCtrlV4.py                  # PX4无人机控制接口
 ├── ReqCopterSim.py                  # 仿真环境通信
@@ -167,6 +177,8 @@ ServerFile/
 │   ├── best.pt                   # 自定义目标检测模型权重
 │   └── ...
 │
+├── saved_detections/                # 保存的检测结果图
+├── logs/                            # 运行日志
 └── .asset/                          # 临时资源文件
 ```
 
@@ -174,7 +186,7 @@ ServerFile/
 
 #### BodyCommMavlink (Communication_Mavlink.py)
 
-**职责:** 无人机通信、目标检测、图像理解、目标逼近控制
+**职责:** 无人机通信、目标检测、图像理解、目标搜索、目标逼近控制、检测图保存
 
 **关键方法:**
 
@@ -185,6 +197,8 @@ ServerFile/
 | `search_object` | 旋转搜索目标(每次40°) | object_names: str | bool (是否找到) |
 | `look` | 使用LLM理解当前图像内容 | - | content: str |
 | `approachObjective` | 控制无人机逼近目标 | error_x, error_y | - |
+| `save_detection_image` | 保存检测结果图或当前摄像头图 | use_latest: bool | file_path: str/None |
+| `save_latest_detection_image` | 保存最近一次缓存检测图 | - | file_path: str/None |
 
 **成员变量:**
 ```python
@@ -198,7 +212,7 @@ self.llm_client     # 火山引擎LLM客户端
 
 #### OpenAI_APIs (OpenAI_api_Mavlink_Agent.py)
 
-**职责:** 智能体交互、代码生成与执行
+**职责:** 智能体交互、代码生成与执行、检测图保存接口封装
 
 **关键方法:**
 
@@ -208,6 +222,8 @@ self.llm_client     # 火山引擎LLM客户端
 | `Agents_UAV` | 主交互循环: 接收指令 -> 生成代码 -> 执行代码 |
 | `execute_generated_code` | 清理并执行LLM生成的Python代码 |
 | `GetHistrory` | 记录对话历史 |
+| `save_detection_image` | 封装检测图保存能力 |
+| `save_latest_detection_image` | 保存最近一次检测缓存图 |
 
 **功能函数注入:**
 ```python
@@ -219,13 +235,22 @@ self.search_object_function  # Comm_api.search_object
 
 #### VolcEngineFakeHFModel (volcEngineLLM.py)
 
-**职责:** 将火山引擎API包装为Hugging Face格式，供SmolAgents使用
+**职责:** 将火山引擎API包装为SmolAgents可调用的模型接口，并统一返回可执行代码块
 
 **配置:**
 ```python
 api_url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
 model_id = "deepseek-v3-250324"
 ```
+
+#### runtime_logger (runtime_logger.py)
+
+**职责:** 统一管理运行日志，记录主程序、通信、智能体和LLM的执行过程
+
+**特点:**
+- 自动生成带时间戳的日志文件
+- 每次运行有独立 run id，方便回溯
+- 终端输出和文件日志同时保留，便于调试
 
 ---
 
@@ -354,9 +379,9 @@ mav.uavGlobalPos   # UE4全局坐标 [X, Y, Z]
 ### 7.2 调试技巧
 
 1. **检测帧率:** CPU环境下det_fps=0.4，GPU环境下det_fps=10
-2. **图像保存:** `annotated_image.jpg` 保存带检测框的图像
-3. **API调用日志:** 查看"火山方舟 API 调用成功/失败"输出
-4. **AI计算时间:** 每次指令会输出AI生成代码耗时
+2. **图像保存:** 优先查看 `saved_detections/` 目录下的检测图，也可以用缓存图回看最近一次结果
+3. **API调用日志:** 查看运行日志里模型请求、检测结果和执行异常信息
+4. **AI计算时间:** 每次指令会输出 AI 生成代码耗时，方便判断是否存在卡顿
 
 ### 7.3 性能优化
 
