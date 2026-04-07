@@ -330,18 +330,34 @@ class OpenAI_APIs(Des):
 
     def _run_agent_for_clause(self, agent, clause: str):
         """
-        执行单个非模板子句（走原 SmolAgents 流程）。
+        执行单个非模板子句（展示模式：仅单次生成，不走SmolAgents内部执行）。
         """
         start_time = time.time()
+        self.logger.info("本轮请求模式=单次生成")
         self.logger.info(f"开始请求模型生成代码, task={clause}")
-        stream_steps = agent.run(clause, stream=True, max_steps=1)
+
+        # 直接调用底层模型进行单次代码生成，避免SmolAgents内部解释执行带来的上下文不一致。
+        class _Msg:
+            def __init__(self, role, content):
+                self.role = role
+                self.content = content
+
+        messages = [
+            _Msg("system", self.Prompt_dit["Prompt_smol"]),
+            _Msg("user", clause),
+        ]
+
         code = ""
-        print("> > > > > " * 10)
-        for step in stream_steps:
-            if hasattr(step, "code_action") and step.code_action:
-                code = step.code_action
-                print(code)
-        print("< < < < < " * 10)
+        try:
+            resp = agent.model.generate(messages)
+            code = getattr(resp, "content", "") or ""
+            print(code)
+        except Exception as e:
+            print(f"模型生成失败：{e}")
+            self.logger.error(f"模型生成失败: {e}")
+            self.logger.debug(traceback.format_exc())
+            return False
+
         self.logger.info("模型代码生成完成")
         print("AI计算时间：", time.time() - start_time, "s")
         self.logger.info(f"AI计算时间: {time.time() - start_time:.3f}s")
