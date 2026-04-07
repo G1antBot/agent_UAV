@@ -13,6 +13,57 @@ class _RunIdFilter(logging.Filter):
         return True
 
 
+class _ConsoleFormatter(logging.Formatter):
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    COLORS = {
+        "DEBUG": "\033[37m",
+        "INFO": "\033[36m",
+        "WARNING": "\033[33m",
+        "ERROR": "\033[31m",
+        "CRITICAL": "\033[31m",
+    }
+
+    EVENT_COLORS = {
+        "CMD_START": "\033[36m",
+        "CMD_END": "\033[32m",
+        "CLAUSE_START": "\033[36m",
+        "CLAUSE_ROUTE": "\033[37m",
+        "CLAUSE_OK": "\033[32m",
+        "CLAUSE_FAIL": "\033[31m",
+        "开始执行": "\033[36m",
+        "执行结束": "\033[32m",
+        "步骤开始": "\033[36m",
+        "步骤执行方式": "\033[37m",
+        "步骤完成": "\033[32m",
+        "步骤失败": "\033[31m",
+    }
+
+    def __init__(self, fmt: str, use_color: bool = True):
+        super().__init__(fmt)
+        self.use_color = use_color
+
+    def format(self, record):
+        base = super().format(record)
+        if not self.use_color:
+            return base
+
+        level_color = self.COLORS.get(record.levelname, "")
+        if level_color:
+            base = base.replace(
+                f"| {record.levelname} |",
+                f"| {self.BOLD}{level_color}{record.levelname}{self.RESET} |",
+                1,
+            )
+
+        for event, color in self.EVENT_COLORS.items():
+            if event in base:
+                base = base.replace(event, f"{self.BOLD}{color}{event}{self.RESET}", 1)
+                break
+
+        return base
+
+
 def init_runtime_logger(log_dir=None, level=logging.INFO):
     global _INITIALIZED
 
@@ -34,8 +85,12 @@ def init_runtime_logger(log_dir=None, level=logging.INFO):
         "%(asctime)s | %(levelname)s | %(name)s | run=%(run_id)s | %(message)s"
     )
 
+    use_color = os.getenv("UAV_LOG_COLOR", "1") != "0"
     stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
+    stream_handler.setFormatter(_ConsoleFormatter(
+        "%(asctime)s | %(levelname)s | %(name)s | run=%(run_id)s | %(message)s",
+        use_color=use_color,
+    ))
     stream_handler.addFilter(run_filter)
 
     file_handler = logging.FileHandler(log_path, encoding="utf-8")

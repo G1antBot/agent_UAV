@@ -52,6 +52,19 @@ class OpenAI_APIs(Des):
         self.logger = get_runtime_logger("agent")
         self.logger.info("OpenAI_APIs 初始化完成")
 
+    def _get_latest_result_cn(self, default_text: str = "执行完成"):
+        """
+        从通信模块读取最近一次任务结果中文描述；若不可用则返回默认值。
+        """
+        try:
+            comm_obj = getattr(self.search_object_function, "__self__", None)
+            if comm_obj is None:
+                return default_text
+            result_cn = getattr(comm_obj, "last_search_result_cn", "")
+            return result_cn if result_cn else default_text
+        except Exception:
+            return default_text
+
     def _split_task_clauses(self, task: str):
         """
         将一条指令切分为多个子句，便于对子句进行模板拦截。
@@ -165,6 +178,79 @@ class OpenAI_APIs(Des):
             return None
 
         return {"type": "face_object", "object_name": object_name}
+
+    def _parse_search_clause(self, clause: str):
+        """
+        解析搜索子句：
+        - 搜索/搜寻/查找某物体 -> quick模式
+        - 周围所有某物体 -> all模式
+        """
+        if not clause:
+            return None
+
+        text = re.sub(r"\s+", "", clause)
+        if not text:
+            return None
+
+        # 全景搜索模式：周围所有/附近所有/所有...（带周围语义）
+        all_mode = False
+        object_name = ""
+        if re.search(r"(?:周围|附近).*(?:所有|全部)|(?:所有|全部).*(?:周围|附近)", text):
+            all_mode = True
+            # 提取“所有”后的对象描述
+            m = re.search(r"(?:周围|附近)?(?:所有|全部)(.+?)$", text)
+            object_name = (m.group(1) if m else "").strip()
+        elif text.startswith("周围所有") or text.startswith("附近所有"):
+            all_mode = True
+            object_name = text.replace("周围所有", "", 1).replace("附近所有", "", 1).strip()
+
+        if all_mode:
+            object_name = re.sub(r"^(?:的|有)", "", object_name).strip()
+            object_name = re.sub(r"(?:情况|有哪些|有什么|在哪|位置)$", "", object_name).strip()
+            if not object_name:
+                return None
+            return {"type": "search", "mode": "all", "object_name": object_name}
+
+        # 快速搜索模式
+        m = re.search(r"(?:搜索|搜寻|查找|找)(.+?)$", text)
+        if not m:
+            return None
+
+        object_name = (m.group(1) or "").strip()
+        object_name = re.sub(r"^(?:一下|下|一个|目标|物体)", "", object_name).strip()
+        object_name = re.sub(r"(?:目标|物体|在哪里|在哪)$", "", object_name).strip()
+        if not object_name:
+            return None
+        return {"type": "search", "mode": "quick", "object_name": object_name}
+
+    def _execute_search_template(self, object_name: str, mode: str):
+        """
+        执行搜索模板：
+        - quick: 当前视野优先，未命中再旋转，命中首个即结束
+        - all: 旋转一圈，统计总数与相对朝向
+        搜索未命中属于正常业务结果，不作为执行异常。
+        """
+        if self.search_object_function is None:
+            print("执行失败：未注入search_object功能")
+            self.logger.warning("搜索模板拒绝执行: 未注入search_object_function")
+            return False
+
+        try:
+            # 兼容旧签名（仅object_name）与新签名（object_name, mode）
+            try:
+                found = self.search_object_function(object_name, mode=mode)
+            except TypeError:
+                found = self.search_object_function(object_name)
+
+            summary = self._get_latest_result_cn(default_text="搜索完成")
+            print(summary)
+            self.logger.info(f"template_search mode={mode} target={object_name} found={bool(found)} summary={summary}")
+            return True
+        except Exception as e:
+            print(f"执行失败：搜索模板异常 {e}")
+            self.logger.error(f"搜索模板执行失败: {e}")
+            self.logger.debug(traceback.format_exc())
+            return False
 
     def _execute_body_move_template(self, dx_body: float, dy_body: float, dz_body: float, distance_m: float, direction_text: str):
         """
@@ -334,7 +420,8 @@ class OpenAI_APIs(Des):
         """
         start_time = time.time()
         self.logger.info("本轮请求模式=单次生成")
-        self.logger.info(f"开始请求模型生成代码, task={clause}")
+        self.logger.info(f"步骤执行方式=AI生成 子句={clause}")
+        self.logger.info(f"开始请求模型生成代码, 任务={clause}")
 
         # 直接调用底层模型进行单次代码生成，避免SmolAgents内部解释执行带来的上下文不一致。
         class _Msg:
@@ -447,13 +534,21 @@ class OpenAI_APIs(Des):
                     print("指令解析失败，请重新输入。")
                     continue
 
+                cmd_start_time = time.time()
+                cmd_id = datetime.now().strftime("%H%M%S")
+                cmd_success = True
+                self.logger.info(f"开始执行 编号={cmd_id} 步骤数={len(clauses)} 指令={task}")
+
                 for idx, clause in enumerate(clauses, start=1):
-                    self.logger.info(f"处理子句[{idx}/{len(clauses)}]: {clause}")
+                    self.logger.info(f"步骤开始 编号={cmd_id} 序号={idx}/{len(clauses)} 内容={clause}")
                     move_parsed = self._parse_body_move_clause(clause)
                     if move_parsed is not None:
+                        self.logger.info(f"步骤执行方式 编号={cmd_id} 序号={idx}/{len(clauses)} 方式=模板位移")
                         if move_parsed.get("type") == "move_invalid":
                             print(f"执行失败：{move_parsed.get('reason', '方向冲突')}")
                             self.logger.warning(f"模板子句解析失败: {move_parsed}")
+                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=方向冲突")
+                            cmd_success = False
                             break
                         ok = self._execute_body_move_template(
                             dx_body=move_parsed["dx_body"],
@@ -465,11 +560,15 @@ class OpenAI_APIs(Des):
                         if not ok:
                             print("子句执行失败，已中止后续子句执行。")
                             self.logger.warning("模板子句执行失败，终止本轮后续子句")
+                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=位移执行失败")
+                            cmd_success = False
                             break
+                        self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
                         continue
 
                     turn_parsed = self._parse_turn_clause(clause)
                     if turn_parsed is not None:
+                        self.logger.info(f"步骤执行方式 编号={cmd_id} 序号={idx}/{len(clauses)} 方式=模板转向")
                         ok = self._execute_turn_template(
                             sign=turn_parsed["sign"],
                             deg=turn_parsed["deg"],
@@ -478,23 +577,56 @@ class OpenAI_APIs(Des):
                         if not ok:
                             print("子句执行失败，已中止后续子句执行。")
                             self.logger.warning("模板子句执行失败，终止本轮后续子句")
+                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=转向执行失败")
+                            cmd_success = False
                             break
+                        self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
+                        continue
+
+                    search_parsed = self._parse_search_clause(clause)
+                    if search_parsed is not None:
+                        self.logger.info(f"步骤执行方式 编号={cmd_id} 序号={idx}/{len(clauses)} 方式=模板搜索")
+                        ok = self._execute_search_template(
+                            object_name=search_parsed["object_name"],
+                            mode=search_parsed["mode"],
+                        )
+                        if not ok:
+                            print("子句执行失败，已中止后续子句执行。")
+                            self.logger.warning("搜索子句执行失败，终止本轮后续子句")
+                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=搜索执行失败")
+                            cmd_success = False
+                            break
+                        self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
                         continue
 
                     face_parsed = self._parse_face_object_clause(clause)
                     if face_parsed is not None:
+                        self.logger.info(f"步骤执行方式 编号={cmd_id} 序号={idx}/{len(clauses)} 方式=模板朝向")
                         ok = self._execute_face_object_template(face_parsed["object_name"])
                         if not ok:
                             print("子句执行失败，已中止后续子句执行。")
                             self.logger.warning("朝向目标子句执行失败，终止本轮后续子句")
+                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=朝向执行失败")
+                            cmd_success = False
                             break
+                        self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
                         continue
 
                     ok = self._run_agent_for_clause(agent, clause)
                     if not ok:
                         print("子句执行失败，已中止后续子句执行。")
                         self.logger.warning("智能体子句执行失败，终止本轮后续子句")
+                        self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=AI生成执行失败")
+                        cmd_success = False
                         break
+                    self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
+
+                cmd_cost = time.time() - cmd_start_time
+                if cmd_success:
+                    result_cn = self._get_latest_result_cn(default_text="执行完成")
+                    self.logger.info(f"执行结束 编号={cmd_id} 状态=成功 结果={result_cn} 总耗时秒={cmd_cost:.2f}")
+                else:
+                    self.logger.warning(f"执行结束 编号={cmd_id} 状态=失败 结果=执行失败 总耗时秒={cmd_cost:.2f}")
             except KeyboardInterrupt:
                 # 捕获键盘中断，退出程序
                 print("\n检测到中断，程序退出。")

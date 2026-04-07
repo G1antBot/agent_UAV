@@ -50,6 +50,7 @@ class BodyCommMavlink(object):
         self.last_detection_image = None
         self.last_detection_time = None
         self.last_detection_has_object = False
+        self.last_search_result_cn = "暂无搜索结果"
         self.logger.info("YOLOE模型加载完成")
 
         # 初始化ReqCopterSim实例，用于与模拟器通信
@@ -109,9 +110,70 @@ class BodyCommMavlink(object):
             "红气球": "red balloon",
             "红色球": "red balloon",
             "无人机": "uav",
+            "无人飞机": "uav",
+            "无人机目标": "uav",
+            "drone": "uav",
+            "drones": "uav",
+            "uav": "uav",
+            "quadcopter": "uav",
             "飞机": "airplane",
+            "airplane": "airplane",
+            "小车":"car",
+            "小车":"car",
+            "车":"car",
+            "无人车":"car",
         }
         return alias_map.get(name, name)
+
+    @staticmethod
+    def _wrap_angle_rad(angle_rad):
+        """
+        将角度归一化到[-pi, pi]。
+        """
+        a = float(angle_rad)
+        while a > math.pi:
+            a -= 2.0 * math.pi
+        while a < -math.pi:
+            a += 2.0 * math.pi
+        return a
+
+    @staticmethod
+    def _format_signed_deg(angle_deg):
+        """
+        将角度格式化为中文左右方向文本。
+        """
+        val = float(angle_deg)
+        if abs(val) < 0.5:
+            return "0°"
+        if val > 0:
+            return f"右{abs(val):.1f}°"
+        return f"左{abs(val):.1f}°"
+
+    @staticmethod
+    def _cluster_angles_deg(angles_deg, threshold_deg=15.0):
+        """
+        对角度做一维聚类去重，避免旋转搜索时同一目标重复计数。
+        """
+        if not angles_deg:
+            return []
+        sorted_vals = sorted(float(v) for v in angles_deg)
+        clusters = [[sorted_vals[0]]]
+        for v in sorted_vals[1:]:
+            if abs(v - clusters[-1][-1]) <= threshold_deg:
+                clusters[-1].append(v)
+            else:
+                clusters.append([v])
+        return [sum(c) / len(c) for c in clusters]
+
+    def _search_summary_line(self, canonical_name, mode, found, angle_list_deg):
+        """
+        生成一行中文搜索总结。
+        """
+        mode_cn = "快速搜索" if mode == "quick" else "全景搜索"
+        if not found:
+            return f"{mode_cn}: 未发现{canonical_name}"
+        angles_text = ", ".join(self._format_signed_deg(v) for v in angle_list_deg)
+        return f"{mode_cn}: 发现{canonical_name}{len(angle_list_deg)}个, 相对朝向[{angles_text}]"
 
     def GetBodyMavList(self):
         # 返回无人机列表、无人机数量和坐标偏移量
@@ -150,8 +212,9 @@ class BodyCommMavlink(object):
                     obj_name = names[cls_id]
                 else:
                     obj_name = str(cls_id)
-                # 当指定了目标名称时，仅返回匹配目标
-                if target_name and str(obj_name).strip().lower() != target_name:
+                # 当指定了目标名称时，仅返回匹配目标（双边归一化，避免drone/uav同义词漏检）
+                canonical_obj_name = self._canonical_object_name(obj_name)
+                if target_name and canonical_obj_name != target_name:
                     continue
                 obj_list.append(obj_name)
                 obj_locs.append(locs[idx] if idx < len(locs) else [])
@@ -176,31 +239,119 @@ class BodyCommMavlink(object):
 
         return obj_list, obj_locs, obj_logits, img_with_box
 
-    def search_object(self, object_names):
-        # 通过旋转无人机的偏航角搜索目标
+    def search_object_detail(self, object_names, mode="quick", yaw_step_deg=40, yaw_hold_s=2.0, camera_hfov_deg=90.0):
+        """
+        搜索目标并返回结构化信息。
+        mode=quick: 先看当前视野，若无目标再旋转搜索，找到首个目标即结束。
+        mode=all: 旋转一整圈，统计目标总数和相对朝向角。
+        """
         canonical_name = self._canonical_object_name(object_names)
-        self.logger.info(f"开始搜索目标: {object_names} -> {canonical_name}")
-        current_yaw = self.MavList[0].uavAngEular[2]
-        for yaw_step in range(0, 360, 40):
-            new_yaw = current_yaw + (yaw_step * 3.14159 / 180)  # 转换为弧度
+        mode = (mode or "quick").strip().lower()
+        if mode not in ("quick", "all"):
+            mode = "quick"
+
+        self.last_search_result_cn = "搜索中"
+        start_yaw = float(self.MavList[0].uavAngEular[2])
+        all_angles_deg = []
+
+        self.logger.info(
+            f"开始搜索目标: query={object_names} canonical={canonical_name} mode={mode} start_yaw={start_yaw:.3f}"
+        )
+
+        def collect_angles_from_frame(base_yaw_rad):
+            obj_list, obj_locs, obj_logits, img_with_box = self.detect_yolo(canonical_name)
+            img_w, _ = img_with_box.size if hasattr(img_with_box, "size") else (640, 480)
+            frame_angles = []
+            for bbox in obj_locs:
+                if not bbox or len(bbox) < 4:
+                    continue
+                center_x = (bbox[0] + bbox[2]) / 2.0
+                pixel_offset = center_x - (img_w / 2.0)
+                offset_deg = (pixel_offset / max(img_w / 2.0, 1.0)) * (camera_hfov_deg / 2.0)
+                frame_angles.append(offset_deg)
+            return frame_angles
+
+        # quick模式先看当前视野
+        if mode == "quick":
+            init_angles = collect_angles_from_frame(start_yaw)
+            if init_angles:
+                unique_angles = self._cluster_angles_deg(init_angles, threshold_deg=15.0)
+                summary = self._search_summary_line(canonical_name, mode, True, unique_angles)
+                self.last_search_result_cn = summary
+                self.logger.info(f"search_quick_hit summary={summary}")
+                return {
+                    "found": True,
+                    "mode": mode,
+                    "object": canonical_name,
+                    "count": len(unique_angles),
+                    "angles_deg": unique_angles,
+                    "summary": summary,
+                }
+
+        # 旋转阶段：quick找到首个目标即结束，all完整旋转一圈
+        for yaw_step in range(0, 360, int(yaw_step_deg)):
+            new_yaw = start_yaw + math.radians(yaw_step)
             self.MavList[0].SendPosNED(
                 self.MavList[0].uavPosNED[0],
                 self.MavList[0].uavPosNED[1],
                 self.MavList[0].uavPosNED[2],
-                new_yaw
+                new_yaw,
             )
-            time.sleep(2)
+            time.sleep(yaw_hold_s)
 
-            # 检测目标
-            obj_list, obj_locs, obj_logits, img_with_box = self.detect_yolo(canonical_name)
-            found = len(obj_list) > 0
-            self.logger.info(f"search_step yaw_step={yaw_step} found={found}")
-            if found:
-                print(canonical_name, " found during rotation.")
-                self.logger.info(f"搜索成功: {canonical_name}")
-                return True
-        self.logger.info(f"搜索失败: {canonical_name}")
-        return False
+            frame_angles = collect_angles_from_frame(new_yaw)
+            frame_found = len(frame_angles) > 0
+            self.logger.info(f"search_step mode={mode} yaw_step={yaw_step} found={frame_found} hits={len(frame_angles)}")
+
+            if frame_found:
+                all_angles_deg.extend(frame_angles)
+                if mode == "quick":
+                    unique_angles = self._cluster_angles_deg(all_angles_deg, threshold_deg=15.0)
+                    summary = self._search_summary_line(canonical_name, mode, True, unique_angles)
+                    self.last_search_result_cn = summary
+                    self.logger.info(f"search_quick_rotate_hit summary={summary}")
+                    return {
+                        "found": True,
+                        "mode": mode,
+                        "object": canonical_name,
+                        "count": len(unique_angles),
+                        "angles_deg": unique_angles,
+                        "summary": summary,
+                    }
+
+        if mode == "all" and all_angles_deg:
+            unique_angles = self._cluster_angles_deg(all_angles_deg, threshold_deg=15.0)
+            summary = self._search_summary_line(canonical_name, mode, True, unique_angles)
+            self.last_search_result_cn = summary
+            self.logger.info(f"search_all_done summary={summary}")
+            return {
+                "found": True,
+                "mode": mode,
+                "object": canonical_name,
+                "count": len(unique_angles),
+                "angles_deg": unique_angles,
+                "summary": summary,
+            }
+
+        summary = self._search_summary_line(canonical_name, mode, False, [])
+        self.last_search_result_cn = summary
+        self.logger.info(f"搜索失败: {summary}")
+        return {
+            "found": False,
+            "mode": mode,
+            "object": canonical_name,
+            "count": 0,
+            "angles_deg": [],
+            "summary": summary,
+        }
+
+    def search_object(self, object_names, mode="quick"):
+        """
+        兼容旧接口：返回布尔值（是否找到）。
+        新增mode参数用于区分快速搜索与全景搜索。
+        """
+        result = self.search_object_detail(object_names, mode=mode)
+        return bool(result.get("found", False))
 
     def cv2_to_base64(self, image, format='.png'):
         # 将OpenCV图像转换为Base64字符串
