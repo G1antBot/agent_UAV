@@ -819,8 +819,8 @@ class BodyCommMavlink(object):
     def strike_objective_to_target(
         self,
         object_names,
-        max_align_seconds=12.0,
-        align_tol=14.0,
+        max_align_seconds=16.0,
+        align_tol=18.0,
         align_tol_y=28.0,
         stable_need=4,
         ram_speed=1.8,
@@ -871,6 +871,7 @@ class BodyCommMavlink(object):
             prev_error_x = None
             prev_error_y = None
             prev_ts = None
+            coarse_align_tol = max(align_tol * 2.5, 40.0)
 
             def clamp(v, vmin, vmax):
                 return vmin if v < vmin else (vmax if v > vmax else v)
@@ -951,7 +952,11 @@ class BodyCommMavlink(object):
                 vz = clamp(kp_y * error_y + kd_y * d_ey, -vz_max, vz_max)
                 well_aligned = (abs(error_x) <= align_tol) and (abs(error_y) <= align_tol_y)
                 vx = schedule_forward_speed(box_max, need_box, error_x, error_y)
-                if not well_aligned:
+                # 粗对准阶段先压制前冲，优先把目标拉回画面中心，避免边冲边偏导致长期不过门限。
+                if abs(error_x) > coarse_align_tol:
+                    yawrate = clamp((kp_x * 1.30) * error_x + kd_x * d_ex, -yaw_max, yaw_max)
+                    vx = 0.0
+                elif not well_aligned:
                     vx = min(vx, ram_speed * 0.55)
                 if abs(error_x) > align_tol * 2.0 or abs(error_y) > align_tol_y * 2.0:
                     vx = min(vx, 0.35)

@@ -1,256 +1,123 @@
-# 实验6-7：无人机视觉语言控制软件在环仿真实验
+# 基于大模型的无人机识别打击控制算法
 
 ## 1. 项目概述
 
-### 1.1 实验背景
+### 1.1 当前版本定位
 
-本实验利用软件在环(SIL)仿真技术研究无人机飞行控制策略。当前项目已经完成中期版本的核心链路搭建，能够通过Python代码生成与无人机控制程序联动，实现无人机根据自然语言指令进行目标搜索、识别和逼近控制。
+本项目当前主链路是“自然语言任务 -> 子句级模板拦截/大模型生成 -> 视觉伺服控制执行 -> 日志回传”的闭环，实现了在 RflySim 软件在环环境中的目标搜索、朝向、靠近与打击动作。
 
-**核心技术栈:**
-- 飞思集群仿真平台 (RflySim)
-- MAVLink通信协议
-- YOLOE / YOLO（目标检测）
-- SmolAgents（代码化智能体）
-- 火山引擎大语言模型（deepseek-v3）
-- runtime_logger（运行日志与调试追踪）
+当前实现重点是：
+1. 分层控制：感知层、决策层、控制层解耦。
+2. 子句拦截：对高频语义优先走模板执行，减少纯生成式控制的不确定性。
+3. 朝向收敛：先对准再推进，保障靠近与打击过程稳定。
 
-### 1.2 实验目标
+说明：ROS 不是当前代码主链路依赖，当前主流程基于 RflySim SDK + MAVLink + Python 运行时。
 
-1. 完成无人机仿真环境、通信链路与坐标系的统一初始化
-2. 构建可运行的感知-决策-控制闭环，并支持自然语言任务执行
-3. 形成可用于中期检查演示的稳定版本，具备日志、检测图保存和异常调试能力
+### 1.2 核心技术栈
+
+- RflySim（SIL 仿真）
+- MAVLink / PX4 控制接口
+- YOLOE（`weights/best.pt`）目标检测
+- SmolAgents + 火山引擎 LLM（`deepseek-v3-250324`）
+- `runtime_logger` 运行日志体系
 
 ---
 
 ## 2. 系统架构
 
-### 2.1 整体流程
+### 2.1 主链路流程
 
 ```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  自然语言指令    │ --> │  SmolAgents    │ --> │ 生成Python代码  │
-│  (如"找红色球")  │     │   大模型决策    │     │                 │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-                                                          │
-                                                          v
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  状态反馈(闭环)  │ <-- │  PX4MavCtrl    │ <-- │   执行代码      │
-│                 │     │  发送控制指令   │     │ 调用感知/控制接口│
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-        ^                                                │
-        │                                                v
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│  无人机执行动作  │ <-- │ MAVLink通信     │ <-- │     YOLO       │
-│ (旋转、逼近目标) │     │ 获取无人机状态  │     │   目标检测      │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-                              │
-                              v
-                    ┌──────────────────┐
-                    │ runtime_logger   │
-                    │ 日志与调试追踪   │
-                    └──────────────────┘
+自然语言指令
+    -> 子句拆分与拦截
+        -> 模板执行(位移/转向/搜索/靠近/朝向)
+        -> 或 AI 生成代码执行(复杂语义)
+            -> 感知反馈(detect_yolo / look)
+                -> 控制下发(SendPosNED / SendVelFRD)
+                    -> 任务结果与日志回传
 ```
-                    **功能:** 实时目标检测，通过自训练权重识别图像中的目标，并为后续控制提供稳定的结构化输出
-### 2.2 三层架构
 
-| 层级 | 功能 | 关键组件 |
+### 2.2 三层职责
+
+| 层级 | 职责 | 当前实现 |
 |------|------|----------|
-| **感知层** | 获取环境和无人机状态 | MAVLink通信、YOLOE目标检测、LLM图像理解、检测图缓存 |
-                    1. 从前置摄像头获取当前图像
-                    2. 使用 `YOLOE` 加载的 `weights/best.pt` 进行推理
-                    3. 按目标名称过滤结果，整理输出框坐标和置信度
-                    4. 缓存带框可视化图，供后续保存和调试使用
-| **决策层** | 将自然语言转换为控制策略 | SmolAgents CodeAgent、火山引擎LLM适配层 |
-| **控制层** | 执行具体控制指令 | PX4MavCtrl、NED坐标系位置/速度控制、两阶段伺服控制 |
-                    **输出特点:**
-                    - 支持按目标名过滤检测结果
-                    - 输出检测框、置信度和带框图像
-                    - 额外缓存最近一次检测图，便于保存和回看
-
-                    **类别到文本的映射:**
-                    由于模型输出的是类别ID，需要通过映射表转换为文本:
----
-
-## 3. 核心模块详解
-
-### 3.1 坐标系定义与转换
-
-**NED坐标系** (无人机本地坐标系):
-                    **核心功能:** 将自然语言指令转化为可执行的Python代码，并把无人机任务拆成可调用的工具链
-- E (East): 东向
-- D (Down): 向下
-                    - 可用函数说明: `detect_yolo()`, `approachObjective()`, `search_object()`, `look()`, `save_detection_image()`
-                    - 控制逻辑约束: 偏航对齐后逼近、误差阈值判断、搜索失败回退等
-                    - 安全保护: 目标丢失检测、超时处理、异常输入处理
-- Y: 北向
-- Z: 向上
-
-**坐标转换公式:**
-    -(GlobalPos_X - NED_X),  # X轴偏移
-    -(GlobalPos_Y - NED_Y),  # Y轴偏移
-    -(GlobalPos_Z - NED_Z)   # Z轴偏移 (注意方向相反)
-]
-```
-
-
-**处理流程:**
-
-**关键参数:**
-```python
-CONF_THRESHOLD = 0.25  # 置信度阈值，低于此值的检测框被过滤
-NMS_THRESHOLD = 0.45   # NMS阈值，控制重叠框的合并程度
-```
-
-**YOLO到文本的映射:**
-由于YOLO输出的是类别ID，需要通过映射表转换为文本:
-```python
-CLASS_NAMES = {0: "red ball", 1: "blue ball", 2: "yellow ball", 3: "airplane"}
-```
-
-**输出格式:**
-- `obj_list`: 检测到的目标名称列表
-- `obj_locs`: 边界框坐标 [x1, y1, x2, y2]
-- `obj_logits`: 置信度分数
-- `img_with_box`: 带标注框的图像
-
-### 3.3 SmolAgents 代码化智能体
-
-**核心功能:** 将自然语言指令转化为可执行的Python代码
-
-**工作流程:**
-1. 输入解析: 用户自然语言指令 -> 任务描述
-2. 代码生成: LLM根据系统提示生成Python代码
-3. 代码执行: 提取代码块并执行
-4. 结果反馈: 将执行结果返回给LLM调整策略
-
-**系统提示模板关键要素:**
-- 可用函数说明: `detect_yolo()`, `approachObjective()`, `search_object()`, `look()`
-- 控制逻辑约束: 偏航对齐后逼近、误差阈值判断等
-- 安全保护: 目标丢失检测、超时处理
-
-### 3.4 目标逼近控制算法 (approachObjective)
-
-**两阶段控制策略:**
-
-#### 阶段1: YAW_ALIGN (偏航对准)
-- 仅调整偏航角，不进行位置移动
-- 偏航角速度计算: `yawrate = K_yaw * error_x` (限幅±30°/s)
-- 对准条件: |error_x| ≤ yaw_align_tol (25像素)，连续满足3次
-
-#### 阶段2: APPROACH (朝向目标推进)
-- 偏航微调: 持续根据error_x调整偏航
-- 速度分解:
-  ```
-  alpha = atan(ey / ay)  # 俯仰方向角
-  vx = v_nom * cos(alpha)  # 前进速度
-  vz = v_nom * sin(alpha)  # 垂直速度 (FRD坐标系)
-  ```
-- 速度限幅: v_min=0.05, v_max=1.0, vz_max=0.35
-
-**误差处理:**
-- 低通滤波: `lp_error = (1-a)*prev + a*cur`，时间常数tau=0.5s(CPU)或0.25s(GPU)
-- 死区处理: |error| ≤ 5像素时视为0，避免抖动
-- 到达判断: |error| ≤ 1像素，连续满足3次认为到达目标
-
-**安全保护:**
-- 目标丢失超时: lost_timeout = max(3.0/det_fps, 1.5)秒
-- 阶段回退: 若偏航误差超过阈值，从APPROACH退回YAW_ALIGN
+| 感知层 | 目标检测与视觉状态读取 | `detect_yolo`、`look`、检测结果缓存与保存 |
+| 决策层 | 指令切分、模板路由、生成式兜底 | `_split_task_clauses` + `_parse_*_clause` + `_run_agent_for_clause` |
+| 控制层 | 动作执行与收敛控制 | `face_objective_to_target`、`approach_objective_to_target`、`strike_objective_to_target` |
 
 ---
 
-## 4. 代码文件结构
+## 3. 当前核心机制
+
+### 3.1 子句拦截与执行优先级
+
+在 `Agents_UAV` 主循环中，输入会先按“然后/并且/标点”拆分为子句，再按优先级尝试模板匹配：
+
+1. 位移模板（机体系前后左右上下）
+2. 转向模板（左转/右转）
+3. 搜索模板（quick/all）
+4. 靠近模板
+5. 朝向模板（只转向不前进）
+6. 未命中模板时，回退到 AI 代码生成执行
+
+这样可将“稳定可规则化”的动作固定在模板层，把复杂语义留给大模型，降低控制漂移和执行歧义。
+
+### 3.2 搜索策略（quick / all）
+
+`search_object_detail` 支持两种模式：
+
+- `quick`：先检测当前视野，未命中则按 40° 步进旋转，命中即停。
+- `all`：完整旋转一圈后统计目标数量，并输出相对朝向角聚类结果。
+
+同时支持目标名归一化（中英文别名映射），减少“同义词导致漏检”的问题。
+
+### 3.3 朝向收敛（原地对准）
+
+`face_objective_to_target` 的目标是“只转向，不推进”：
+
+1. 先搜索目标。
+2. 循环检测目标框中心误差。
+3. 调用 `faceObjectiveOnly` 输出偏航角速度。
+4. 连续满足对准阈值后判定收敛。
+
+该机制用于在靠近和打击前稳定机头方向，降低后续动作的横向误差。
+
+### 3.4 分层逼近（YAW_ALIGN -> APPROACH）
+
+`approachObjective` 采用两阶段伺服：
+
+1. `YAW_ALIGN`：仅调偏航，直到水平误差连续满足阈值。
+2. `APPROACH`：保持偏航微调，同时根据图像误差分解前进/垂直速度。
+
+并包含低通滤波、死区、阶段回退、目标丢失超时和指令节流，核心目的是“先对准，再前进”，保证靠近过程可收敛。
+
+`approach_objective_to_target` 在上层封装了“搜索 -> 循环检测 -> 伺服靠近 -> 停稳判定”的完整任务闭环。
+
+### 3.5 打击动作（高级模板能力）
+
+`strike_objective_to_target` 在搜索与对准后执行前冲穿越并停稳，属于高风险动作能力，默认作为高级动作由任务语义触发。
+
+---
+
+## 4. 代码结构（与当前仓库一致）
 
 ```
 ServerFile/
-├── main.py                          # 主程序入口
-├── Communication_Mavlink.py         # MAVLink通信与目标检测核心类
-├── OpenAI_api_Mavlink_Agent.py      # SmolAgents智能体封装
-├── volcEngineLLM.py                 # 火山引擎LLM API封装
-├── Description.py                   # 提示词模板定义
-├── Coordinate_Transformation.py     # 坐标转换工具
-├── runtime_logger.py                # 运行日志封装
-├── VisionCaptureApi.py              # 视觉捕获API
-├── PX4MavCtrlV4.py                  # PX4无人机控制接口
-├── ReqCopterSim.py                  # 仿真环境通信
-│
-├── weights/                       # 自定义目标检测模型权重
-│   ├── best.pt                   # 自定义目标检测模型权重
-│   └── ...
-│
-├── saved_detections/                # 保存的检测结果图
-├── logs/                            # 运行日志
-└── .asset/                          # 临时资源文件
+├── main.py                        # 程序入口，组装通信与智能体
+├── Communication_Mavlink.py       # 感知与控制核心实现
+├── OpenAI_api_Mavlink_Agent.py    # 子句拦截、模板执行、AI生成兜底
+├── Description.py                 # 系统提示词与能力约束
+├── Coordinate_Transformation.py   # 机体系->NED 坐标转换
+├── volcEngineLLM.py               # 火山引擎模型适配
+├── runtime_logger.py              # 日志封装
+├── Config.json                    # 运行配置
+├── weights/
+│   └── best.pt                    # 当前检测主权重
+├── logs/
+└── saved_detections/
 ```
 
-### 4.1 核心类说明
-
-#### BodyCommMavlink (Communication_Mavlink.py)
-
-**职责:** 无人机通信、目标检测、图像理解、目标搜索、目标逼近控制、检测图保存
-
-**关键方法:**
-
-| 方法名 | 功能 | 参数 | 返回值 |
-|--------|------|------|--------|
-| `__init__` | 初始化MAVLink连接、加载YOLO模型、启动图像捕获 | - | - |
-| `detect_yolo` | 使用YOLO检测目标 | object_names: str | obj_list, obj_locs, obj_logits, img |
-| `search_object` | 旋转搜索目标(每次40°) | object_names: str | bool (是否找到) |
-| `look` | 使用LLM理解当前图像内容 | - | content: str |
-| `approachObjective` | 控制无人机逼近目标 | error_x, error_y | - |
-| `save_detection_image` | 保存检测结果图或当前摄像头图 | use_latest: bool | file_path: str/None |
-| `save_latest_detection_image` | 保存最近一次缓存检测图 | - | file_path: str/None |
-
-**成员变量:**
-```python
-self.MavList        # 无人机控制器列表
-self.VehilceNum     # 无人机数量
-self.Error2UE4Map   # 坐标系偏移量
-self.yolo_model    # YOLO模型实例
-self.vis            # VisionCaptureApi实例(图像捕获)
-self.llm_client     # 火山引擎LLM客户端
-```
-
-#### OpenAI_APIs (OpenAI_api_Mavlink_Agent.py)
-
-**职责:** 智能体交互、代码生成与执行、检测图保存接口封装
-
-**关键方法:**
-
-| 方法名 | 功能 |
-|--------|------|
-| `__init__` | 初始化无人机列表、API密钥、功能函数引用 |
-| `Agents_UAV` | 主交互循环: 接收指令 -> 生成代码 -> 执行代码 |
-| `execute_generated_code` | 清理并执行LLM生成的Python代码 |
-| `GetHistrory` | 记录对话历史 |
-| `save_detection_image` | 封装检测图保存能力 |
-| `save_latest_detection_image` | 保存最近一次检测缓存图 |
-
-**功能函数注入:**
-```python
-self.detect_function         # Comm_api.detect_yolo
-self.approachObjective_function  # Comm_api.approachObjective
-self.look_function           # Comm_api.look
-self.search_object_function  # Comm_api.search_object
-```
-
-#### VolcEngineFakeHFModel (volcEngineLLM.py)
-
-**职责:** 将火山引擎API包装为SmolAgents可调用的模型接口，并统一返回可执行代码块
-
-**配置:**
-```python
-api_url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-model_id = "deepseek-v3-250324"
-```
-
-#### runtime_logger (runtime_logger.py)
-
-**职责:** 统一管理运行日志，记录主程序、通信、智能体和LLM的执行过程
-
-**特点:**
-- 自动生成带时间戳的日志文件
-- 每次运行有独立 run id，方便回溯
-- 终端输出和文件日志同时保留，便于调试
+说明：视觉采集与飞控底层接口通过 RflySim SDK 路径注入（`sys.path.append(...)`），不在本仓库内维护。
 
 ---
 
