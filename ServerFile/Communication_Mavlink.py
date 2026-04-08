@@ -18,6 +18,7 @@ from ultralytics import YOLOE
 from PIL import Image
 
 import math
+import re
 import traceback
 from datetime import datetime
 from runtime_logger import get_runtime_logger
@@ -98,7 +99,7 @@ class BodyCommMavlink(object):
         """
         if object_name is None:
             return ""
-        name = str(object_name).strip().lower()
+        name = self._normalize_label(object_name)
         if not name:
             return ""
 
@@ -124,6 +125,26 @@ class BodyCommMavlink(object):
             "无人车":"car",
         }
         return alias_map.get(name, name)
+
+    @staticmethod
+    def _normalize_label(name):
+        """
+        统一标签文本：小写、去两端空白、下划线/连字符转空格、压缩多余空格。
+        例如：blue_ball / blue-ball /  blue   ball  -> blue ball
+        """
+        text = str(name).strip().lower()
+        text = re.sub(r"[_-]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    @staticmethod
+    def _compact_label(name):
+        """
+        生成紧凑标签用于兜底匹配：去除空格、下划线、连字符。
+        例如：blue_ball / blue ball / blue-ball -> blueball
+        """
+        text = str(name).strip().lower()
+        return re.sub(r"[\s_-]+", "", text)
 
     @staticmethod
     def _wrap_angle_rad(angle_rad):
@@ -199,6 +220,7 @@ class BodyCommMavlink(object):
         names = result.names if hasattr(result, "names") else {}
         obj_list, obj_locs, obj_logits = [], [], []
         target_name = self._canonical_object_name(object_names)
+        target_compact = self._compact_label(target_name) if target_name else ""
 
         if boxes is not None and len(boxes) > 0:
             cls_ids = boxes.cls.detach().cpu().numpy().astype(int).tolist() if boxes.cls is not None else []
@@ -214,7 +236,8 @@ class BodyCommMavlink(object):
                     obj_name = str(cls_id)
                 # 当指定了目标名称时，仅返回匹配目标（双边归一化，避免drone/uav同义词漏检）
                 canonical_obj_name = self._canonical_object_name(obj_name)
-                if target_name and canonical_obj_name != target_name:
+                obj_compact = self._compact_label(canonical_obj_name)
+                if target_name and canonical_obj_name != target_name and obj_compact != target_compact:
                     continue
                 obj_list.append(obj_name)
                 obj_locs.append(locs[idx] if idx < len(locs) else [])
@@ -708,6 +731,297 @@ class BodyCommMavlink(object):
             print(f"执行失败：原地转向目标异常 {e}")
             self.logger.error(f"face_objective_to_target执行失败: {e}")
             self.logger.debug(traceback.format_exc())
+            return False
+
+    def approach_objective_to_target(self, object_names, max_seconds=20.0, align_tol=80.0, stable_need=3, box_ratio=1.0/5.0):
+        """
+        靠近目标：先搜索目标，再循环检测并逼近，直到达到停止条件。
+        """
+        if not object_names:
+            print("执行失败：目标名称不能为空")
+            self.logger.warning("approach_objective_to_target拒绝执行: 目标名称为空")
+            self.last_search_result_cn = "靠近失败：目标为空"
+            return False
+
+        canonical_name = self._canonical_object_name(object_names)
+
+        try:
+            if not self.search_object(canonical_name, mode="quick"):
+                print(f"执行失败：未找到目标 {object_names}")
+                self.logger.warning(f"approach_objective_to_target搜索失败: {object_names} -> {canonical_name}")
+                self.last_search_result_cn = f"靠近失败：未找到{canonical_name}"
+                return False
+
+            start_ts = time.monotonic()
+            stable_cnt = 0
+
+            while True:
+                if time.monotonic() - start_ts > max_seconds:
+                    self.logger.warning(
+                        f"approach_objective_to_target超时: target={canonical_name} elapsed={time.monotonic() - start_ts:.2f}s"
+                    )
+                    self.last_search_result_cn = f"靠近失败：靠近{canonical_name}超时"
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                    return False
+
+                obj_list, obj_locs, obj_logits, img_with_box = self.detect_yolo(canonical_name)
+                if not obj_list or not obj_locs:
+                    stable_cnt = 0
+                    self.logger.warning(f"approach_objective_to_target丢失目标: {canonical_name}")
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                    time.sleep(0.08)
+                    continue
+
+                bbox = obj_locs[0]
+                if len(bbox) < 4:
+                    stable_cnt = 0
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                    time.sleep(0.08)
+                    continue
+
+                img_w, img_h = img_with_box.size if hasattr(img_with_box, "size") else (640, 480)
+                center_x = (bbox[0] + bbox[2]) / 2.0
+                center_y = (bbox[1] + bbox[3]) / 2.0
+                error_x = center_x - img_w / 2.0
+                error_y = center_y - img_h / 2.0
+                box_w = max(0.0, bbox[2] - bbox[0])
+                box_h = max(0.0, bbox[3] - bbox[1])
+                box_max = max(box_w, box_h)
+                need_box = img_w * box_ratio
+
+                stop_now = (box_max >= need_box) and (abs(error_x) <= align_tol) and (abs(error_y) <= align_tol)
+                stable_cnt = stable_cnt + 1 if stop_now else 0
+
+                self.logger.info(
+                    f"approach_target_loop target={canonical_name} ex={error_x:.1f} ey={error_y:.1f} box={box_max:.1f}/{need_box:.1f} stable={stable_cnt}/{stable_need} stop={stop_now}"
+                )
+
+                if stable_cnt >= stable_need:
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                    self.last_search_result_cn = f"靠近完成：已逼近{canonical_name}并停稳"
+                    self.logger.info(f"approach_done target={canonical_name} result={self.last_search_result_cn}")
+                    print(self.last_search_result_cn)
+                    return True
+
+                self.approachObjective(error_x, error_y)
+                time.sleep(0.08)
+        except Exception as e:
+            print(f"执行失败：靠近目标异常 {e}")
+            self.logger.error(f"approach_objective_to_target执行失败: {e}")
+            self.logger.debug(traceback.format_exc())
+            self.last_search_result_cn = "靠近失败：执行异常"
+            try:
+                self.MavList[0].SendVelFRD(0, 0, 0, 0)
+            except Exception:
+                pass
+            return False
+
+    def strike_objective_to_target(
+        self,
+        object_names,
+        max_align_seconds=12.0,
+        align_tol=14.0,
+        align_tol_y=28.0,
+        stable_need=4,
+        ram_speed=1.8,
+        ram_seconds=0.30,
+        extra_forward_m=1.5,
+        hit_box_ratio=1.0 / 5.0,
+        kp_x=0.00085,
+        kd_x=0.00012,
+        kp_y=0.0028,
+        kd_y=0.00018,
+    ):
+        """
+        打击目标（视觉伺服+速度调度版）：
+        先搜索目标，再在前进中持续修正偏航和高度，并按目标大小动态调节前进速度，满足命中条件后穿越并停稳。
+        """
+        if not object_names:
+            print("执行失败：目标名称不能为空")
+            self.logger.warning("strike_objective_to_target拒绝执行: 目标名称为空")
+            self.last_search_result_cn = "打击失败：目标为空"
+            return False
+
+        if ram_speed <= 0 or ram_seconds <= 0 or extra_forward_m < 0 or hit_box_ratio <= 0:
+            print("执行失败：打击参数非法")
+            self.logger.warning(
+                f"strike_objective_to_target参数非法: speed={ram_speed}, ram_seconds={ram_seconds}, extra_m={extra_forward_m}, hit_box_ratio={hit_box_ratio}"
+            )
+            self.last_search_result_cn = "打击失败：参数非法"
+            return False
+
+        canonical_name = self._canonical_object_name(object_names)
+
+        try:
+            # 阶段1：先快速搜索目标
+            if not self.search_object(canonical_name, mode="quick"):
+                print(f"执行失败：未找到目标 {object_names}")
+                self.logger.warning(f"strike_objective_to_target搜索失败: {object_names} -> {canonical_name}")
+                self.last_search_result_cn = f"打击失败：未找到{canonical_name}"
+                return False
+
+            # 阶段2：闭环引导冲刺（边前进边修正偏航）
+            guide_start_ts = time.monotonic()
+            stable_hit_cnt = 0
+            lost_cnt = 0
+            step_dt = 0.08
+            yaw_max = math.radians(35)
+            vz_max = 0.35
+            terminal_enter_ratio = 0.45
+            prev_error_x = None
+            prev_error_y = None
+            prev_ts = None
+
+            def clamp(v, vmin, vmax):
+                return vmin if v < vmin else (vmax if v > vmax else v)
+
+            def schedule_forward_speed(box_now, box_need, ex_now, ey_now):
+                """
+                根据目标框大小与对准程度调度前进速度。
+                目标越小越快，越接近命中框越慢；偏离中心时进一步降速。
+                """
+                if box_need <= 0:
+                    return 0.25
+
+                box_ratio = clamp(box_now / box_need, 0.0, 1.5)
+                if box_ratio < 0.35:
+                    base_v = ram_speed * 1.00
+                elif box_ratio < 0.65:
+                    base_v = ram_speed * 0.80
+                elif box_ratio < 0.90:
+                    base_v = ram_speed * 0.55
+                else:
+                    base_v = ram_speed * 0.28
+
+                align_ratio_x = abs(ex_now) / max(align_tol, 1.0)
+                align_ratio_y = abs(ey_now) / max(align_tol_y, 1.0)
+                align_penalty = max(0.35, 1.0 - 0.35 * max(align_ratio_x, align_ratio_y))
+                return clamp(base_v * align_penalty, 0.20, ram_speed)
+
+            while True:
+                elapsed = time.monotonic() - guide_start_ts
+                if elapsed > max_align_seconds:
+                    self.logger.warning(
+                        f"strike_guide超时: target={canonical_name} elapsed={elapsed:.2f}s stable_hit={stable_hit_cnt}/{stable_need}"
+                    )
+                    self.last_search_result_cn = f"打击失败：引导超时，未命中{canonical_name}"
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                    return False
+
+                obj_list, obj_locs, obj_logits, img_with_box = self.detect_yolo(canonical_name)
+                if not obj_list or not obj_locs:
+                    lost_cnt += 1
+                    # 目标短时丢失时先悬停，避免继续直行导致目标更快出画
+                    self.MavList[0].SendVelFRD(0.0, 0.0, 0.0, 0.0)
+                    if lost_cnt >= 6:
+                        self.logger.warning(f"strike_guide丢失目标过久: target={canonical_name}")
+                        self.last_search_result_cn = f"打击失败：引导阶段丢失{canonical_name}"
+                        self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                        return False
+                    time.sleep(step_dt)
+                    continue
+
+                lost_cnt = 0
+                bbox = obj_locs[0]
+                if len(bbox) < 4:
+                    self.MavList[0].SendVelFRD(0.0, 0.0, 0.0, 0.0)
+                    time.sleep(step_dt)
+                    continue
+
+                img_w, img_h = img_with_box.size if hasattr(img_with_box, "size") else (640, 480)
+                center_x = (bbox[0] + bbox[2]) / 2.0
+                center_y = (bbox[1] + bbox[3]) / 2.0
+                box_w = max(0.0, bbox[2] - bbox[0])
+                box_h = max(0.0, bbox[3] - bbox[1])
+                box_max = max(box_w, box_h)
+                need_box = img_w * hit_box_ratio
+
+                error_x = center_x - img_w / 2.0
+                error_y = center_y - img_h / 2.0
+                now_ts = time.monotonic()
+                dt_vision = now_ts - prev_ts if prev_ts is not None else step_dt
+                dt_vision = max(dt_vision, 1e-3)
+                d_ex = (error_x - prev_error_x) / dt_vision if prev_error_x is not None else 0.0
+                d_ey = (error_y - prev_error_y) / dt_vision if prev_error_y is not None else 0.0
+                prev_error_x = error_x
+                prev_error_y = error_y
+                prev_ts = now_ts
+
+                yawrate = clamp(kp_x * error_x + kd_x * d_ex, -yaw_max, yaw_max)
+                vz = clamp(kp_y * error_y + kd_y * d_ey, -vz_max, vz_max)
+                well_aligned = (abs(error_x) <= align_tol) and (abs(error_y) <= align_tol_y)
+                vx = schedule_forward_speed(box_max, need_box, error_x, error_y)
+                if not well_aligned:
+                    vx = min(vx, ram_speed * 0.55)
+                if abs(error_x) > align_tol * 2.0 or abs(error_y) > align_tol_y * 2.0:
+                    vx = min(vx, 0.35)
+                self.MavList[0].SendVelFRD(vx, 0.0, vz, yawrate)
+
+                hit_now = well_aligned and (box_max >= need_box)
+                stable_hit_cnt = (stable_hit_cnt + 1) if hit_now else 0
+
+                # 目标已经足够大时，直接进入终端短冲，不再强求连续稳定命中
+                if box_max >= img_w * terminal_enter_ratio:
+                    self.logger.info(
+                        f"strike_terminal_enter target={canonical_name} box={box_max:.1f} enter={img_w * terminal_enter_ratio:.1f} stable={stable_hit_cnt}/{stable_need}"
+                    )
+                    break
+
+                self.logger.info(
+                    f"strike_guide target={canonical_name} ex={error_x:.1f}/{align_tol:.1f} ey={error_y:.1f}/{align_tol_y:.1f} box={box_max:.1f}/{need_box:.1f} allow={hit_now} stable={stable_hit_cnt}/{stable_need} vx={vx:.2f} vz={vz:.2f} yawrate={yawrate:.3f}"
+                )
+
+                if stable_hit_cnt >= stable_need:
+                    break
+                time.sleep(step_dt)
+
+            # 阶段3：终端短冲收尾，不再继续依赖检测，避免近距离穿模后失锁
+            box_ratio = box_max / max(need_box, 1.0)
+            if box_ratio < 1.15:
+                base_terminal_seconds = 0.48
+            elif box_ratio < 1.50:
+                base_terminal_seconds = 0.36
+            else:
+                base_terminal_seconds = 0.28
+            terminal_speed = clamp(ram_speed * 0.60, 0.45, 1.20)
+
+            # 穿越冲刺：在基础短冲之上，叠加一段按额外前进距离换算的时间
+            pass_seconds = (extra_forward_m / max(terminal_speed, 0.1)) * 0.65
+            terminal_seconds = clamp(base_terminal_seconds + pass_seconds, 0.35, 1.80)
+
+            self.logger.info(
+                f"strike_terminal target={canonical_name} box_ratio={box_ratio:.2f} speed={terminal_speed:.2f} base_s={base_terminal_seconds:.2f} pass_s={pass_seconds:.2f} total_s={terminal_seconds:.2f}"
+            )
+            print(
+                f"[STRIKE] target={canonical_name} 进入终端穿越冲刺: speed={terminal_speed:.2f}m/s, duration={terminal_seconds:.2f}s"
+            )
+
+            t0 = time.monotonic()
+            while True:
+                elapsed = time.monotonic() - t0
+                if elapsed >= terminal_seconds:
+                    break
+                self.MavList[0].SendVelFRD(terminal_speed, 0.0, 0.0, 0.0)
+                time.sleep(step_dt)
+
+            # 阶段4：刹停
+            self.MavList[0].SendVelFRD(0, 0, 0, 0)
+            time.sleep(0.15)
+            self.MavList[0].SendVelFRD(0, 0, 0, 0)
+
+            self.last_search_result_cn = f"打击完成：已对{canonical_name}执行终端短冲并停稳"
+            self.logger.info(f"strike_done target={canonical_name} result={self.last_search_result_cn}")
+            print(self.last_search_result_cn)
+            return True
+        except Exception as e:
+            print(f"执行失败：打击目标异常 {e}")
+            self.logger.error(f"strike_objective_to_target执行失败: {e}")
+            self.logger.debug(traceback.format_exc())
+            self.last_search_result_cn = "打击失败：执行异常"
+            try:
+                self.MavList[0].SendVelFRD(0, 0, 0, 0)
+            except Exception:
+                pass
             return False
 
     def save_detection_image(self, output_dir=None, file_name=None, use_latest=False):
