@@ -25,7 +25,7 @@ if __name__ == '__main__':
         MavList,
         VehilceNum,
         Comm_api.detect_yolo,  # 目标检测函数
-        Comm_api.approach_objective_to_target,  # 接近目标函数
+        Comm_api.approachObjective,  # 误差控制靠近函数
         Comm_api.look,  # 前置摄像头图像处理函数
         Comm_api.search_object,  # 搜索目标函数
         Comm_api.save_detection_image,  # 保存检测结果图函数

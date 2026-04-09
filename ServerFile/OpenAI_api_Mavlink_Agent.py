@@ -12,6 +12,8 @@ import cv2
 import re
 import traceback
 import math
+import sys
+import types
 
 from datetime import datetime, timezone
 from Description import Description as Des
@@ -99,6 +101,101 @@ class OpenAI_APIs(Des):
             f"结果: {summary}",
         ]
         self._emit_highlight_block("步骤结果", lines, ok=success)
+
+    def _handle_hard_rules(self, task: str):
+        """
+        极薄硬规则层：处理退出/急停与基础位移，其他语义交给LLM。
+        返回(action, summary)
+        action取值："continue" 表示已处理并进入下一轮；"pass" 表示交给LLM。
+        """
+        text = (task or "").strip()
+        if not text:
+            return "continue", "空指令"
+
+        if text.lower() in self.ExitList:
+            print("对话结束，程序退出。")
+            self.logger.info("用户主动退出")
+            raise KeyboardInterrupt
+
+        # 急停硬规则：立即清零速度，避免模型生成延迟造成风险
+        if re.search(r"急停|紧急停止|立即停止|stop\b", text, flags=re.IGNORECASE):
+            try:
+                self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                self.logger.warning("触发硬规则: 紧急停止")
+                print("已执行紧急停止。")
+                return "continue", "紧急停止已执行"
+            except Exception as e:
+                self.logger.error(f"紧急停止执行失败: {e}")
+                print(f"紧急停止执行失败: {e}")
+                return "continue", "紧急停止失败"
+
+        # 基础位移硬规则：前后左右上下 + 米数，直接走确定性模板，避免LLM坐标映射偏差。
+        move_parsed = self._parse_body_move_clause(text)
+        if move_parsed is not None:
+            if move_parsed.get("type") == "move_invalid":
+                reason = move_parsed.get("reason", "位移方向冲突")
+                print(f"执行失败：{reason}")
+                self.logger.warning(f"基础位移硬规则拒绝执行: {reason}")
+                return "continue", reason
+            ok = self._execute_body_move_template(
+                dx_body=move_parsed["dx_body"],
+                dy_body=move_parsed["dy_body"],
+                dz_body=move_parsed["dz_body"],
+                distance_m=move_parsed["distance_m"],
+                direction_text=move_parsed["direction_text"],
+            )
+            if ok:
+                return "continue", "基础位移执行完成"
+            return "continue", "基础位移执行失败"
+
+        return "pass", "交由LLM处理"
+
+    def _guard_check_deadline(self):
+        """任务看门狗：超时后立即急停并中止本轮执行。"""
+        state = getattr(self, "_task_guard_state", None)
+        if not state:
+            return
+        deadline = state.get("deadline")
+        if deadline is None:
+            return
+        if time.monotonic() > deadline:
+            try:
+                self.MavList[0].SendVelFRD(0, 0, 0, 0)
+            except Exception:
+                pass
+            raise RuntimeError("任务执行超时，已触发急停保护")
+
+    @staticmethod
+    def _validate_target_name(target):
+        """仅允许非空字符串目标名，拒绝纯数字/坐标类输入。"""
+        if not isinstance(target, str):
+            return None
+        text = target.strip()
+        if not text:
+            return None
+        if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
+            return None
+        if re.fullmatch(r"\[.*\]|\(.*\)", text):
+            return None
+        return text
+
+    @staticmethod
+    def _normalize_object_alias(name):
+        """归一化常见目标别名，减少LLM在英文/中文目标名上的漂移。"""
+        if not isinstance(name, str):
+            return name
+        text = name.strip()
+        alias_map = {
+            "drone": "uav",
+            "无人机": "uav",
+            "uav": "uav",
+            "balloon": "balloon",
+            "气球": "balloon",
+            "red balloon": "red balloon",
+            "blue ball": "blue ball",
+            "小球": "blue ball",
+        }
+        return alias_map.get(text.lower(), alias_map.get(text, text))
 
     def _split_task_clauses(self, task: str):
         """
@@ -482,8 +579,6 @@ class OpenAI_APIs(Des):
             print("执行失败：未注入face_objective功能")
             self.logger.warning("原地朝向目标拒绝执行: 未注入face_objective_function")
             return False
-
-        self.logger.info(f"template_face_object target={object_name}")
         ok = self.face_objective_function(object_name)
         if not ok:
             self.logger.warning(f"原地朝向目标失败: {object_name}")
@@ -494,6 +589,14 @@ class OpenAI_APIs(Des):
         """
         执行单个非模板子句（展示模式：仅单次生成，不走SmolAgents内部执行）。
         """
+        # 清理上一任务残留摘要，避免本轮结果展示被历史搜索信息污染。
+        try:
+            comm_obj = getattr(self.search_object_function, "__self__", None)
+            if comm_obj is not None and hasattr(comm_obj, "last_search_result_cn"):
+                comm_obj.last_search_result_cn = ""
+        except Exception:
+            pass
+
         start_time = time.time()
         self.logger.info("本轮请求模式=单次生成")
         self.logger.info(f"步骤执行方式=AI生成 子句={clause}")
@@ -526,8 +629,15 @@ class OpenAI_APIs(Des):
         self.logger.info(f"AI计算时间: {time.time() - start_time:.3f}s")
 
         if code.strip():
-            self.execute_generated_code(code)
-            return True
+            self._task_guard_state = {
+                "deadline": time.monotonic() + 45.0,
+                "search_calls": 0,
+                "max_search_calls": 4,
+                "clause": clause,
+            }
+            ok = self.execute_generated_code(code)
+            self._task_guard_state = None
+            return bool(ok)
         self.logger.warning("本轮未收到可执行代码")
         print("未生成可执行代码，请重试指令。")
         return False
@@ -545,7 +655,13 @@ class OpenAI_APIs(Des):
 
     def execute_generated_code(self, code: str):
         # 定义全局命名空间，包含当前类实例、time模块、body_to_ned函数和final_answer函数
-        exec_globals = {"self": self, "time": time, "b2n": b2n, "final_answer": lambda x: print(f"执行成功：{x}")}
+        exec_globals = {
+            "self": self,
+            "time": time,
+            "b2n": b2n,
+            "display": lambda *args, **kwargs: None,
+            "final_answer": lambda x: print(f"执行成功：{x}"),
+        }
         # 兼容<code>和```python两种代码包裹格式
         code = code.strip()
         code_tag_match = re.search(r"<code>\s*([\s\S]*?)\s*</code>", code, flags=re.IGNORECASE)
@@ -553,17 +669,165 @@ class OpenAI_APIs(Des):
             code = code_tag_match.group(1).strip()
         fence_match = re.search(r"```(?:python)?\s*([\s\S]*?)\s*```", code, flags=re.IGNORECASE)
         clean_code = fence_match.group(1).strip() if fence_match else code
+        # 清理模型常见误导入：b2n已由执行器注入，不需要from utils import b2n
+        clean_code = re.sub(r"^\s*from\s+utils\s+import\s+b2n\s*$", "", clean_code, flags=re.MULTILINE)
+        # 兼容可视化语句：display已注入为no-op，无需依赖IPython。
+        clean_code = re.sub(r"^\s*from\s+IPython\.display\s+import\s+display\s*$", "", clean_code, flags=re.MULTILINE)
+        # 为LLM生成代码注入受限工具包装器，避免参数污染与无限搜索循环。
+        orig_search = self.search_object_function
+        orig_approach = self.approachObjective_function
+        orig_detect = self.detect_function
+        orig_face = self.face_objective_function
+        orig_strike = self.strike_objective_function
+
+        class SearchResult:
+            def __init__(self, found, obj_list=None, obj_locs=None, obj_logits=None, img_with_box=None, summary=None):
+                self.found = bool(found)
+                self.obj_list = obj_list or []
+                self.obj_locs = obj_locs or []
+                self.obj_logits = obj_logits or []
+                self.img_with_box = img_with_box
+                self.summary = summary
+
+            def __iter__(self):
+                yield self.found
+                yield self.obj_list
+                yield self.obj_locs
+                yield self.obj_logits
+                yield self.img_with_box
+
+            def __bool__(self):
+                return self.found
+
+        def safe_search(target, mode="quick"):
+            self._guard_check_deadline()
+            valid = self._validate_target_name(target)
+            if valid is None:
+                raise ValueError(f"非法目标名称: {target}")
+            valid = self._normalize_object_alias(valid)
+            state = getattr(self, "_task_guard_state", None) or {}
+            state["search_calls"] = int(state.get("search_calls", 0)) + 1
+            if state["search_calls"] > int(state.get("max_search_calls", 4)):
+                try:
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                except Exception:
+                    pass
+                raise RuntimeError("搜索重试次数超限，已中止任务")
+            self._task_guard_state = state
+            found = orig_search(valid, mode=mode)
+
+            obj_list = []
+            obj_locs = []
+            obj_logits = []
+            img_with_box = None
+            if callable(getattr(self, "detect_function", None)):
+                try:
+                    detect_result = self.detect_function(valid)
+                    if isinstance(detect_result, dict):
+                        obj_list = detect_result.get("obj_list", []) or []
+                        obj_locs = detect_result.get("obj_locs", []) or []
+                        obj_logits = detect_result.get("obj_logits", []) or []
+                        img_with_box = detect_result.get("img_with_box")
+                    elif isinstance(detect_result, (list, tuple)) and len(detect_result) >= 4:
+                        obj_list, obj_locs, obj_logits, img_with_box = detect_result[:4]
+                except Exception:
+                    self.logger.debug("safe_search: 补充检测结果失败", exc_info=True)
+
+            summary = self._get_latest_result_cn(default_text="搜索完成")
+            return SearchResult(found, obj_list, obj_locs, obj_logits, img_with_box, summary=summary)
+
+        def safe_approach(*args):
+            self._guard_check_deadline()
+            if len(args) == 2:
+                error_x, error_y = args
+                if not isinstance(error_x, (int, float)) or not isinstance(error_y, (int, float)):
+                    raise ValueError(f"非法误差参数: {args}")
+                return orig_approach(float(error_x), float(error_y))
+            if len(args) == 1:
+                target = args[0]
+                valid = self._validate_target_name(target)
+                if valid is None:
+                    raise ValueError(f"非法目标名称: {target}")
+                valid = self._normalize_object_alias(valid)
+                # 兼容旧代码：如果LLM仍传目标名，则把它转回高层靠近目标接口
+                if hasattr(self, "approach_objective_function") and callable(getattr(self, "approach_objective_function")):
+                    return self.approach_objective_function(valid)
+                return orig_approach(valid)
+            raise ValueError(f"靠近参数数量错误: {args}")
+
+        def safe_face(target):
+            self._guard_check_deadline()
+            valid = self._validate_target_name(target)
+            if valid is None:
+                raise ValueError(f"非法目标名称: {target}")
+            valid = self._normalize_object_alias(valid)
+            if orig_face is None:
+                raise RuntimeError("face_objective_function未注入")
+            return orig_face(valid)
+
+        def safe_strike(target):
+            self._guard_check_deadline()
+            valid = self._validate_target_name(target)
+            if valid is None:
+                raise ValueError(f"非法目标名称: {target}")
+            valid = self._normalize_object_alias(valid)
+            if orig_strike is None:
+                raise RuntimeError("strike_objective_function未注入")
+            return orig_strike(valid)
+
+        def safe_detect(target):
+            valid = self._validate_target_name(target)
+            if valid is None:
+                raise ValueError(f"非法目标名称: {target}")
+            canonical = self._normalize_object_alias(valid)
+            result = orig_detect(canonical)
+            if isinstance(result, tuple) and len(result) >= 4:
+                obj_list = list(result[0]) if result[0] is not None else []
+                obj_locs = result[1]
+                obj_logits = result[2]
+                img_with_box = result[3]
+                if canonical not in obj_list and valid not in obj_list:
+                    return result
+                if valid not in obj_list:
+                    obj_list = [valid] + obj_list
+                return obj_list, obj_locs, obj_logits, img_with_box
+            return result
+
+        self.search_object_function = safe_search
+        self.approachObjective_function = safe_approach
+        self.detect_function = safe_detect
+        self.face_objective_function = safe_face
+        self.strike_objective_function = safe_strike
+
+        # 兼容模型误写的 `from utils import b2n`。
+        utils_backup = sys.modules.get("utils")
+        shim_utils = types.ModuleType("utils")
+        shim_utils.b2n = b2n
+        sys.modules["utils"] = shim_utils
+
         try:
             self.logger.info("开始执行生成代码")
             self.logger.debug(f"代码内容:\n{clean_code}")
             # 执行代码
             exec(clean_code, exec_globals)
             self.logger.info("生成代码执行完成")
+            return True
         except Exception as e:
             # 捕获并打印执行过程中可能出现的异常
             print(f"执行失败：{e}")
             self.logger.error(f"生成代码执行失败: {e}")
             self.logger.debug(traceback.format_exc())
+            return False
+        finally:
+            self.search_object_function = orig_search
+            self.approachObjective_function = orig_approach
+            self.detect_function = orig_detect
+            self.face_objective_function = orig_face
+            self.strike_objective_function = orig_strike
+            if utils_backup is None:
+                sys.modules.pop("utils", None)
+            else:
+                sys.modules["utils"] = utils_backup
 
     # 智能体模式
     def Agents_UAV(self):
@@ -604,189 +868,38 @@ class OpenAI_APIs(Des):
                     continue
                 self.logger.info(f"接收指令: {task}")
 
-                # 子句级拦截：位移模板优先，其他子句走原 SmolAgents
-                clauses = self._split_task_clauses(task)
-                if not clauses:
-                    print("指令解析失败，请重新输入。")
+                action, summary = self._handle_hard_rules(task)
+                if action == "continue":
+                    self.logger.info(f"硬规则处理完成: {summary}")
                     continue
 
                 cmd_start_time = time.time()
                 cmd_id = datetime.now().strftime("%H%M%S")
-                cmd_success = True
-                step_results = []
-                self.logger.info(f"开始执行 编号={cmd_id} 步骤数={len(clauses)} 指令={task}")
-
-                for idx, clause in enumerate(clauses, start=1):
-                    self.logger.info(f"步骤开始 编号={cmd_id} 序号={idx}/{len(clauses)} 内容={clause}")
-                    move_parsed = self._parse_body_move_clause(clause)
-                    if move_parsed is not None:
-                        mode_cn = "模板位移"
-                        self.logger.info(f"步骤执行方式 编号={cmd_id} 序号={idx}/{len(clauses)} 方式=模板位移")
-                        if move_parsed.get("type") == "move_invalid":
-                            print(f"执行失败：{move_parsed.get('reason', '方向冲突')}")
-                            self.logger.warning(f"模板子句解析失败: {move_parsed}")
-                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=方向冲突")
-                            summary = "位移方向冲突，已中止"
-                            step_results.append({"idx": idx, "mode": mode_cn, "success": False, "summary": summary})
-                            self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, False, summary)
-                            cmd_success = False
-                            break
-                        ok = self._execute_body_move_template(
-                            dx_body=move_parsed["dx_body"],
-                            dy_body=move_parsed["dy_body"],
-                            dz_body=move_parsed["dz_body"],
-                            distance_m=move_parsed["distance_m"],
-                            direction_text=move_parsed["direction_text"],
-                        )
-                        if not ok:
-                            print("子句执行失败，已中止后续子句执行。")
-                            self.logger.warning("模板子句执行失败，终止本轮后续子句")
-                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=位移执行失败")
-                            summary = "位移执行失败，已中止"
-                            step_results.append({"idx": idx, "mode": mode_cn, "success": False, "summary": summary})
-                            self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, False, summary)
-                            cmd_success = False
-                            break
-                        self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
-                        summary = "位移执行完成"
-                        step_results.append({"idx": idx, "mode": mode_cn, "success": True, "summary": summary})
-                        self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, True, summary)
-                        continue
-
-                    turn_parsed = self._parse_turn_clause(clause)
-                    if turn_parsed is not None:
-                        mode_cn = "模板转向"
-                        self.logger.info(f"步骤执行方式 编号={cmd_id} 序号={idx}/{len(clauses)} 方式=模板转向")
-                        ok = self._execute_turn_template(
-                            sign=turn_parsed["sign"],
-                            deg=turn_parsed["deg"],
-                            turn_text=turn_parsed["turn_text"],
-                        )
-                        if not ok:
-                            print("子句执行失败，已中止后续子句执行。")
-                            self.logger.warning("模板子句执行失败，终止本轮后续子句")
-                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=转向执行失败")
-                            summary = "转向执行失败，已中止"
-                            step_results.append({"idx": idx, "mode": mode_cn, "success": False, "summary": summary})
-                            self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, False, summary)
-                            cmd_success = False
-                            break
-                        self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
-                        summary = "转向执行完成"
-                        step_results.append({"idx": idx, "mode": mode_cn, "success": True, "summary": summary})
-                        self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, True, summary)
-                        continue
-
-                    search_parsed = self._parse_search_clause(clause)
-                    if search_parsed is not None:
-                        mode_cn = "模板搜索"
-                        self.logger.info(f"步骤执行方式 编号={cmd_id} 序号={idx}/{len(clauses)} 方式=模板搜索")
-                        ok = self._execute_search_template(
-                            object_name=search_parsed["object_name"],
-                            mode=search_parsed["mode"],
-                        )
-                        if not ok:
-                            print("子句执行失败，已中止后续子句执行。")
-                            self.logger.warning("搜索子句执行失败，终止本轮后续子句")
-                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=搜索执行失败")
-                            summary = self._get_latest_result_cn(default_text="搜索执行失败，已中止")
-                            step_results.append({"idx": idx, "mode": mode_cn, "success": False, "summary": summary})
-                            self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, False, summary)
-                            cmd_success = False
-                            break
-                        self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
-                        summary = self._get_latest_result_cn(default_text="搜索完成")
-                        step_results.append({"idx": idx, "mode": mode_cn, "success": True, "summary": summary})
-                        self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, True, summary)
-                        continue
-
-                    approach_parsed = self._parse_approach_clause(clause)
-                    if approach_parsed is not None:
-                        mode_cn = "模板靠近"
-                        self.logger.info(f"步骤执行方式 编号={cmd_id} 序号={idx}/{len(clauses)} 方式=模板靠近")
-                        ok = self._execute_approach_template(approach_parsed["object_name"])
-                        if not ok:
-                            print("子句执行失败，已中止后续子句执行。")
-                            self.logger.warning("靠近子句执行失败，终止本轮后续子句")
-                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=靠近执行失败")
-                            summary = self._get_latest_result_cn(default_text="靠近执行失败，已中止")
-                            step_results.append({"idx": idx, "mode": mode_cn, "success": False, "summary": summary})
-                            self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, False, summary)
-                            cmd_success = False
-                            break
-                        self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
-                        summary = self._get_latest_result_cn(default_text="靠近完成")
-                        step_results.append({"idx": idx, "mode": mode_cn, "success": True, "summary": summary})
-                        self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, True, summary)
-                        continue
-
-                    face_parsed = self._parse_face_object_clause(clause)
-                    if face_parsed is not None:
-                        mode_cn = "模板朝向"
-                        self.logger.info(f"步骤执行方式 编号={cmd_id} 序号={idx}/{len(clauses)} 方式=模板朝向")
-                        ok = self._execute_face_object_template(face_parsed["object_name"])
-                        if not ok:
-                            print("子句执行失败，已中止后续子句执行。")
-                            self.logger.warning("朝向目标子句执行失败，终止本轮后续子句")
-                            self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=朝向执行失败")
-                            summary = "朝向执行失败，已中止"
-                            step_results.append({"idx": idx, "mode": mode_cn, "success": False, "summary": summary})
-                            self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, False, summary)
-                            cmd_success = False
-                            break
-                        self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
-                        summary = "朝向执行完成"
-                        step_results.append({"idx": idx, "mode": mode_cn, "success": True, "summary": summary})
-                        self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, True, summary)
-                        continue
-
-                    mode_cn = "AI生成"
-                    ok = self._run_agent_for_clause(agent, clause)
-                    if not ok:
-                        print("子句执行失败，已中止后续子句执行。")
-                        self.logger.warning("智能体子句执行失败，终止本轮后续子句")
-                        self.logger.warning(f"步骤失败 编号={cmd_id} 序号={idx}/{len(clauses)} 原因=AI生成执行失败")
-                        summary = "AI生成执行失败，已中止"
-                        step_results.append({"idx": idx, "mode": mode_cn, "success": False, "summary": summary})
-                        self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, False, summary)
-                        cmd_success = False
-                        break
-                    self.logger.info(f"步骤完成 编号={cmd_id} 序号={idx}/{len(clauses)}")
-                    summary = self._get_latest_result_cn(default_text="AI步骤执行完成")
-                    step_results.append({"idx": idx, "mode": mode_cn, "success": True, "summary": summary})
-                    self._emit_step_result(cmd_id, idx, len(clauses), mode_cn, True, summary)
-
+                cmd_start_time = time.time()
+                cmd_id = datetime.now().strftime("%H%M%S")
+                ok = self._run_agent_for_clause(agent, task)
                 cmd_cost = time.time() - cmd_start_time
-                step_success_count = sum(1 for x in step_results if x.get("success"))
-                step_fail_count = len(step_results) - step_success_count
-                all_step_summary = " | ".join(
-                    [f"{x.get('idx')}.{x.get('summary', '')}" for x in step_results]
-                ) if step_results else "无步骤结果"
-                if cmd_success:
+                if ok:
                     result_cn = self._get_latest_result_cn(default_text="执行完成")
-                    self.logger.info(f"执行结束 编号={cmd_id} 状态=成功 结果={result_cn} 总耗时秒={cmd_cost:.2f}")
                     self._emit_highlight_block(
                         "任务结果",
                         [
                             f"任务编号: {cmd_id}",
                             "状态: 成功",
-                            f"总步骤: {len(clauses)}, 成功: {step_success_count}, 失败: {step_fail_count}",
+                            "执行方式: LLM主导",
                             f"关键结果: {result_cn}",
-                            f"步骤摘要: {all_step_summary}",
                             f"总耗时: {cmd_cost:.2f} 秒",
                         ],
                         ok=True,
                     )
                 else:
-                    self.logger.warning(f"执行结束 编号={cmd_id} 状态=失败 结果=执行失败 总耗时秒={cmd_cost:.2f}")
                     self._emit_highlight_block(
                         "任务结果",
                         [
                             f"任务编号: {cmd_id}",
                             "状态: 失败",
-                            f"总步骤: {len(clauses)}, 成功: {step_success_count}, 失败: {step_fail_count}",
-                            "关键结果: 执行失败",
-                            f"步骤摘要: {all_step_summary}",
+                            "执行方式: LLM主导",
+                            "关键结果: LLM生成执行失败",
                             f"总耗时: {cmd_cost:.2f} 秒",
                         ],
                         ok=False,

@@ -6,14 +6,34 @@ from collections import defaultdict
 from datetime import datetime
 
 
+def _norm_key(key):
+    text = str(key or "").strip().lstrip("\ufeff").strip('"').strip("'")
+    return text
+
+
+def _pick_row_run_id(row):
+    # 兼容BOM、runId等变体表头
+    if "run_id" in row and row.get("run_id"):
+        return row.get("run_id")
+    for k, v in row.items():
+        nk = _norm_key(k).lower().replace("-", "_").replace(" ", "")
+        if nk in ("run_id", "runid") and v:
+            return v
+    return ""
+
+
 def _load_rows(csv_path):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
     rows = []
-    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        for raw_row in reader:
+            row = {_norm_key(k): v for k, v in (raw_row or {}).items()}
+            # 保底写入标准run_id键，避免后续流程受表头编码影响
+            if not row.get("run_id"):
+                row["run_id"] = _pick_row_run_id(row)
             try:
                 row["success"] = int(row.get("success", 0))
             except Exception:
@@ -27,7 +47,11 @@ def _load_rows(csv_path):
 
 
 def _pick_run_id(rows, run_id=None):
-    run_ids = [r.get("run_id", "") for r in rows if r.get("run_id")]
+    run_ids = []
+    for r in rows:
+        rid = _pick_row_run_id(r)
+        if rid:
+            run_ids.append(rid)
     if not run_ids:
         raise ValueError("No run_id found in CSV")
     if run_id:
@@ -128,7 +152,7 @@ def main():
     parser = argparse.ArgumentParser(description="Summarize eval_summary.csv for PPT-ready metrics.")
     parser.add_argument(
         "--csv",
-        default=os.path.join(os.path.dirname(__file__), "logs", "test_eval", "eval_summary.csv"),
+        default=os.path.join(os.path.dirname(__file__), "logs", "test_llm", "eval_summary.csv"),
         help="Path to eval_summary.csv",
     )
     parser.add_argument("--run-id", default="", help="Specific run_id to summarize. Default: latest run_id in csv.")

@@ -430,6 +430,9 @@ class BodyCommMavlink(object):
                 "phase": "YAW_ALIGN",  # 初始阶段：先对准偏航
                 "yaw_hold_need": 3,  # 连续满足阈值的次数，用于确认偏航对准
                 "yaw_hold_cnt": 0,  # 当前连续满足阈值的计数
+                "yaw_align_timeout": 3.0 if is_cpu else 2.0,  # 对准阶段超时后强制切到推进，避免原地卡死
+                "yaw_align_enter_ts": time.monotonic(),
+                "yaw_recheck_ts": 0.0,  # 强制切相位后短暂禁止立刻回切
 
                 # —— 误差处理 ——
                 "tau_err": 0.5 if is_cpu else 0.25,  # 低通滤波器的时间常数，用于平滑误差
@@ -540,14 +543,25 @@ class BodyCommMavlink(object):
 
                 if s["yaw_hold_cnt"] >= s["yaw_hold_need"]:
                     s["phase"] = "APPROACH"  # 转入推进阶段
+                    s["yaw_recheck_ts"] = t
+
+                # 防卡死：若长期无法进入对准阈值，强制先推进一段时间，避免任务整体超时
+                if (t - s["yaw_align_enter_ts"]) >= s["yaw_align_timeout"]:
+                    s["phase"] = "APPROACH"
+                    s["yaw_hold_cnt"] = 0
+                    s["yaw_recheck_ts"] = t + 1.2
+                    self.logger.warning(
+                        f"approach_fallback force_phase=APPROACH ex={s['lp_ex']:.2f} ey={s['lp_ey']:.2f}"
+                    )
 
                 cmd = (vx, vy, vz, yawrate)
 
             # ========== 阶段 2：朝向目标推进 ==========
             else:  # "APPROACH"
                 # 若偏航又变大，退回对准阶段
-                if abs(s["lp_ex"]) > 1.5 * s["yaw_align_tol"]:
+                if abs(s["lp_ex"]) > 1.5 * s["yaw_align_tol"] and t >= s["yaw_recheck_ts"]:
                     s["phase"] = "YAW_ALIGN"
+                    s["yaw_align_enter_ts"] = t
                     # 立即给一次对准指令（可选）
                     yawrate = clamp(s["K_yaw"] * ex, -s["yaw_max"], s["yaw_max"])
                     cmd = (0.0, 0.0, 0.0, yawrate)
