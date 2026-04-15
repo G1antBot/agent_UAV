@@ -775,6 +775,40 @@ class OpenAI_APIs(Des):
                 raise RuntimeError("strike_objective_function未注入")
             return orig_strike(valid)
 
+        def guard_offboard_init(mav):
+            """
+            将 initOffboard 包装为幂等调用，避免同一控制对象重复启动线程。
+            """
+            if mav is None:
+                return
+            if getattr(mav, "_copilot_init_offboard_guarded", False):
+                return
+
+            original_init_offboard = getattr(mav, "initOffboard", None)
+            if not callable(original_init_offboard):
+                return
+
+            state_attr = "_copilot_offboard_started"
+            if not hasattr(mav, state_attr):
+                setattr(mav, state_attr, False)
+
+            def _guarded_init_offboard(*args, **kwargs):
+                if getattr(mav, state_attr, False):
+                    self.logger.info("initOffboard 已处于启动状态，跳过重复调用")
+                    return True
+                result = original_init_offboard(*args, **kwargs)
+                setattr(mav, state_attr, True)
+                return result
+
+            mav.initOffboard = _guarded_init_offboard
+            mav._copilot_init_offboard_guarded = True
+
+        for mav in getattr(self, "MavList", []) or []:
+            try:
+                guard_offboard_init(mav)
+            except Exception:
+                self.logger.debug("initOffboard 幂等包装失败", exc_info=True)
+
         def safe_detect(target):
             valid = self._validate_target_name(target)
             if valid is None:
@@ -868,26 +902,51 @@ class OpenAI_APIs(Des):
                     continue
                 self.logger.info(f"接收指令: {task}")
 
-                action, summary = self._handle_hard_rules(task)
-                if action == "continue":
-                    self.logger.info(f"硬规则处理完成: {summary}")
-                    continue
+                clauses = self._split_task_clauses(task)
+                if not clauses:
+                    clauses = [task]
 
                 cmd_start_time = time.time()
                 cmd_id = datetime.now().strftime("%H%M%S")
-                cmd_start_time = time.time()
-                cmd_id = datetime.now().strftime("%H%M%S")
-                ok = self._run_agent_for_clause(agent, task)
+                overall_ok = True
+                last_summary = ""
+
+                for idx, clause in enumerate(clauses, start=1):
+                    self.logger.info(f"CLAUSE_START cmd_id={cmd_id} idx={idx}/{len(clauses)} clause={clause}")
+
+                    action, summary = self._handle_hard_rules(clause)
+                    if action == "continue":
+                        # 硬规则执行后按语义判断该步是否成功。
+                        step_ok = not any(k in (summary or "") for k in ("失败", "拒绝", "冲突", "超时", "异常"))
+                        last_summary = summary
+                        self._emit_step_result(cmd_id, idx, len(clauses), "硬规则", step_ok, summary)
+                        if not step_ok:
+                            overall_ok = False
+                            self.logger.warning(f"CLAUSE_ABORT cmd_id={cmd_id} idx={idx} reason={summary}")
+                            break
+                        continue
+
+                    ok = self._run_agent_for_clause(agent, clause)
+                    if ok:
+                        summary = self._get_latest_result_cn(default_text="执行完成")
+                    else:
+                        summary = "LLM生成执行失败"
+                    last_summary = summary
+                    self._emit_step_result(cmd_id, idx, len(clauses), "LLM主导", bool(ok), summary)
+                    if not ok:
+                        overall_ok = False
+                        self.logger.warning(f"CLAUSE_ABORT cmd_id={cmd_id} idx={idx} reason={summary}")
+                        break
+
                 cmd_cost = time.time() - cmd_start_time
-                if ok:
-                    result_cn = self._get_latest_result_cn(default_text="执行完成")
+                if overall_ok:
                     self._emit_highlight_block(
                         "任务结果",
                         [
                             f"任务编号: {cmd_id}",
                             "状态: 成功",
-                            "执行方式: LLM主导",
-                            f"关键结果: {result_cn}",
+                            "执行方式: 多子句顺序执行",
+                            f"关键结果: {last_summary or '执行完成'}",
                             f"总耗时: {cmd_cost:.2f} 秒",
                         ],
                         ok=True,
@@ -898,8 +957,8 @@ class OpenAI_APIs(Des):
                         [
                             f"任务编号: {cmd_id}",
                             "状态: 失败",
-                            "执行方式: LLM主导",
-                            "关键结果: LLM生成执行失败",
+                            "执行方式: 多子句顺序执行",
+                            f"关键结果: {last_summary or '执行失败'}",
                             f"总耗时: {cmd_cost:.2f} 秒",
                         ],
                         ok=False,

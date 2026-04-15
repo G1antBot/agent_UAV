@@ -29,10 +29,6 @@ ue = UE4CtrlAPI.UE4CtrlAPI()
 # #设置静态柱子
 ue.sendUE4PosScale(copterID=100002,vehicleType=824,PosE=[5,-1,2.0])
 ue.sendUE4PosScale(copterID=100003,vehicleType=824,PosE=[5,2,2.0])
-ue.sendUE4PosScale(copterID=100004,vehicleType=824,PosE=[4,0.5,2.0])
-# 新增一根柱子：放在红球这一侧，并比红球更远离蓝球
-ue.sendUE4PosScale(copterID=100006,vehicleType=824,PosE=[5.0,-2.2,2.0])
-
 
 
 #以下代码调试使用Python 控小车
@@ -43,10 +39,9 @@ ue.sendUE4PosScale(copterID=2,vehicleType=100000501,PosE=[5,-1,-1.2])
 
 ue.sendUE4PosScale(copterID=3,vehicleType=102000152,Scale=[0.05, 0.05, 0.05],PosE=[5,2,-1.12])
 
-ue.sendUE4PosScale(copterID=4,vehicleType=310,PosE=[4,0.5,-1])
+ue.sendUE4PosScale(copterID=4,vehicleType=310,PosE=[4,0.5,0])
 
-# 将补充的 814 小车放在新增柱子的顶部
-ue.sendUE4PosScale(copterID=100005,vehicleType=814,PosE=[5.0,-2.2,-1.00])
+ue.sendUE4PosScale(copterID=100005,vehicleType=814,PosE=[5.0,-2.2,0])
 
 
 # time.sleep(5)
