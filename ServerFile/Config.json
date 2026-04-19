@@ -1,4 +1,22 @@
 {
+    "run_mode": "real_mocap", // 运行模式: sim(软件在环仿真) / real_mocap(实飞+动捕)
+    "allow_mock_mocap_for_debug": true, // 是否允许real_mocap下自动注入mock动捕回调（默认关闭）
+    "real_camera": {
+        "source": "opencv", // real_mocap下图像来源: opencv
+        "device_index": 0, // 本地相机索引
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "preview": {
+            "auto_start": true, // real_mocap启动后自动开启实时预览
+            "window_name": "RealCam YOLO Preview",
+            "detect_hz": 8.0, // YOLO检测频率(Hz)
+            "target_name": "", // 空字符串=显示全部类别
+            "show_overlay": true,
+            "hotkey_quit": "q", // 关闭预览窗口
+            "hotkey_save": "s" // 保存当前检测图
+        }
+    },
     "VisionSensors":[
         {
             "SeqID":0, //视觉传感器序号0 1 2 3 ...排序。如果填0，则自动递增排序。

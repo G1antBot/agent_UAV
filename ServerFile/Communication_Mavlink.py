@@ -2,8 +2,10 @@
 import cv2
 import numpy as np
 import time
+import threading
 import sys
 import os
+import json
 sys.path.append(r"D:\Rflysim\RflySimAPIs\RflySimSDK\vision")
 import VisionCaptureApi
 import PX4MavCtrlV4 as PX4MavCtrl
@@ -22,11 +24,24 @@ import re
 import traceback
 from datetime import datetime
 from runtime_logger import get_runtime_logger
+from Coordinate_Transformation import body_to_ned as b2n
 
 
 class BodyCommMavlink(object):
     def __init__(self):
         self.logger = get_runtime_logger("comm")
+        self._runtime_cfg = self._load_runtime_config()
+        self.run_mode = self._load_run_mode_from_config()
+        self._image_source_mode = "visioncapture" if self.run_mode == "sim" else "opencv"
+        self._real_cam = None
+        self._camera_lock = threading.Lock()
+        self._detect_lock = threading.Lock()
+        self._preview_cfg = self._load_realtime_preview_config()
+        self._preview_running = False
+        self._preview_thread = None
+        self._preview_stop_event = threading.Event()
+        self._preview_last_status = "未启动"
+        self._real_camera_index = 0
         # 检查是否使用GPU
         if torch.cuda.is_available():
             print("use_gpu")
@@ -34,7 +49,7 @@ class BodyCommMavlink(object):
         else:
             print("use_cpu")
             self.is_cup = True
-        self.logger.info(f"通信模块启动, is_cpu={self.is_cup}")
+        self.logger.info(f"通信模块启动, run_mode={self.run_mode}, is_cpu={self.is_cup}")
 
 
         # 初始化火山引擎LLM客户端
@@ -54,24 +69,73 @@ class BodyCommMavlink(object):
         self.last_search_result_cn = "暂无搜索结果"
         self.logger.info("YOLOE模型加载完成")
 
-        # 初始化ReqCopterSim实例，用于与模拟器通信
-        self.req = ReqCopterSim.ReqCopterSim()
-        StartCopterID = 1  # 起始无人机ID
-        TargetIP = self.req.getSimIpID(StartCopterID)  # 获取目标模拟器的IP地址
+        # 最低硬约束：仿真和实飞默认一致开启
+        self._safety_cfg = {
+            "enabled": True,
+            "single_vehicle_only": True,
+            "enable_space_fence": False,
+            "max_radius_m": 3.0,
+            "task_timeout_s": 180.0,
+            "timeout_action": "hover",
+            "projection_dt_s": 0.35,
+            "alt_ned_min": -1.8,
+            "alt_ned_max": -0.3,
+            "motion_limits": {
+                "generic": {"xy": 0.8, "z": 0.35, "yawrate_deg": 45.0},
+                "search": {"xy": 0.8, "z": 0.35, "yawrate_deg": 45.0},
+                "face": {"xy": 0.0, "z": 0.0, "yawrate_deg": 45.0},
+                "approach": {"xy": 1.0, "z": 0.35, "yawrate_deg": 45.0},
+                "strike": {"xy": 1.2, "z": 0.35, "yawrate_deg": 60.0},
+                "land": {"xy": 0.0, "z": 0.0, "yawrate_deg": 0.0},
+            },
+        }
+        self._safety_motion_mode = "generic"
+        # 仅在任务开始时由上层显式设置，避免把程序空闲时间计入任务超时。
+        self._safety_task_start_ts = None
+        self._safety_guards_installed = False
+        self._mocap_bridge_running = False
+        self._mocap_bridge_thread = None
+        self._mocap_bridge_stop_event = threading.Event()
+        self._mocap_pose_provider = None
+        # 动捕坐标默认按ENU解释并映射到NED，可按实验室坐标系调整
+        self._mocap_cfg = {
+            "x_axis": "x",   # mocap x -> north
+            "y_axis": "y",   # mocap y -> east
+            "z_axis": "z",   # mocap z -> up(随后转NED)
+            "x_sign": 1.0,
+            "y_sign": 1.0,
+            "z_sign": 1.0,
+            "pos_offset_ned": [0.0, 0.0, 0.0],
+            "rpy_offset_rad": [0.0, 0.0, 0.0],
+        }
 
-        # 初始化VisionCaptureApi实例，用于获取前置摄像头的图像
-        self.vis = VisionCaptureApi.VisionCaptureApi(TargetIP)
-        self.vis.jsonLoad()  # 加载配置文件
-        self.vis.sendReqToUE4(0, TargetIP)  # 向UE4发送请求
-        self.vis.startImgCap()  # 启动图像捕获
+        # 运行模式初始化：sim沿用RflySim链路，real_mocap不再写死仿真图像链路
+        self.req = None
+        self.vis = None
+        StartCopterID = 1  # 起始无人机ID
+        if self.run_mode == "sim":
+            self.req = ReqCopterSim.ReqCopterSim()
+            TargetIP = self.req.getSimIpID(StartCopterID)
+
+            self.vis = VisionCaptureApi.VisionCaptureApi(TargetIP)
+            self.vis.jsonLoad()
+            self.vis.sendReqToUE4(0, TargetIP)
+            self.vis.startImgCap()
+        else:
+            TargetIP = "127.0.0.1"
+            self._init_real_camera_from_config()
+            self.logger.warning("run_mode=real_mocap: 已启用真实相机取流与动捕桥接模式")
 
         # 初始化无人机列表
         self.VehilceNum = 1  # 无人机数量
         self.MavList = []
         for i in range(self.VehilceNum):
             CopterID = StartCopterID + i  # 当前无人机ID
-            TargetIP = self.req.getSimIpID(CopterID)  # 获取目标模拟器的IP地址
-            self.req.sendReSimIP(CopterID)  # 将无人机连接到指定的模拟器IP地址
+            if self.run_mode == "sim" and self.req is not None:
+                TargetIP = self.req.getSimIpID(CopterID)
+                self.req.sendReSimIP(CopterID)
+            else:
+                TargetIP = "127.0.0.1"
             time.sleep(1)
             self.MavList = self.MavList + [PX4MavCtrl.PX4MavCtrler(CopterID, TargetIP)]  # 创建无人机控制器实例并添加到列表中
         time.sleep(2)
@@ -92,6 +156,668 @@ class BodyCommMavlink(object):
                     mav.uavGlobalPos[2] - mav.uavPosNED[2]  # Z轴偏移
                 ])
             ]
+
+        self._home_pos_ned = np.array([
+            float(self.MavList[0].uavPosNED[0]),
+            float(self.MavList[0].uavPosNED[1]),
+            float(self.MavList[0].uavPosNED[2]),
+        ])
+        self._install_motion_safety_guards()
+        self.logger.info(
+            f"安全约束已启用: radius={self._safety_cfg['max_radius_m']}m, timeout={self._safety_cfg['task_timeout_s']}s, "
+            f"alt_ned=[{self._safety_cfg['alt_ned_min']},{self._safety_cfg['alt_ned_max']}], "
+            f"space_fence={self._safety_cfg['enable_space_fence']}, single_vehicle_only={self._safety_cfg['single_vehicle_only']}"
+        )
+
+    def _load_runtime_config(self):
+        """加载运行配置（兼容Config.json中的注释）。"""
+        config_path = os.path.join(os.path.dirname(__file__), "Config.json")
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            cleaned = re.sub(r"//.*", "", raw)
+            return json.loads(cleaned)
+        except Exception as e:
+            self.logger.warning(f"读取Config.json失败，使用默认配置: {e}")
+            return {}
+
+    def _load_run_mode_from_config(self):
+        """从Config.json读取运行模式，默认sim。"""
+        try:
+            cfg = self._runtime_cfg if isinstance(self._runtime_cfg, dict) else {}
+            mode = str(cfg.get("run_mode", "sim")).strip().lower()
+            if mode in ("sim", "real_mocap"):
+                return mode
+            self.logger.warning(f"Config.json run_mode非法({mode})，回退sim")
+            return "sim"
+        except Exception as e:
+            self.logger.warning(f"解析run_mode失败，回退sim: {e}")
+            return "sim"
+
+    def is_mock_mocap_allowed(self):
+        """是否允许real_mocap模式下自动注入mock动捕回调（默认False）。"""
+        cfg = self._runtime_cfg if isinstance(self._runtime_cfg, dict) else {}
+        raw = cfg.get("allow_mock_mocap_for_debug", False)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        return False
+
+    def _load_realtime_preview_config(self):
+        """读取实飞实时预览配置。"""
+        cfg = self._runtime_cfg if isinstance(self._runtime_cfg, dict) else {}
+        cam_cfg = cfg.get("real_camera", {}) if isinstance(cfg.get("real_camera", {}), dict) else {}
+        preview = cam_cfg.get("preview", {}) if isinstance(cam_cfg.get("preview", {}), dict) else {}
+
+        def _as_bool(v, default):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "on")
+            if isinstance(v, (int, float)):
+                return bool(v)
+            return default
+
+        def _as_float(v, default, low=None, high=None):
+            try:
+                val = float(v)
+            except Exception:
+                val = float(default)
+            if low is not None:
+                val = max(low, val)
+            if high is not None:
+                val = min(high, val)
+            return val
+
+        return {
+            "auto_start": _as_bool(preview.get("auto_start", True), True),
+            "window_name": str(preview.get("window_name", "RealCam YOLO Preview")).strip() or "RealCam YOLO Preview",
+            "detect_hz": _as_float(preview.get("detect_hz", 8.0), 8.0, low=0.5, high=60.0),
+            "target_name": str(preview.get("target_name", "")).strip(),
+            "show_overlay": _as_bool(preview.get("show_overlay", True), True),
+            "hotkey_save": str(preview.get("hotkey_save", "s")).strip().lower()[:1] or "s",
+            "hotkey_quit": str(preview.get("hotkey_quit", "q")).strip().lower()[:1] or "q",
+        }
+
+    def _init_real_camera_from_config(self):
+        """实飞模式初始化真实相机。"""
+        cfg = self._runtime_cfg if isinstance(self._runtime_cfg, dict) else {}
+        cam_cfg = cfg.get("real_camera", {}) if isinstance(cfg.get("real_camera", {}), dict) else {}
+        source = str(cam_cfg.get("source", "opencv")).strip().lower()
+        self._image_source_mode = source
+
+        if source != "opencv":
+            self.logger.warning(f"暂不支持的real_camera.source={source}，回退opencv")
+            self._image_source_mode = "opencv"
+
+        cam_index = int(cam_cfg.get("device_index", 0))
+        self._real_camera_index = cam_index
+        width = int(cam_cfg.get("width", 640))
+        height = int(cam_cfg.get("height", 480))
+        fps = int(cam_cfg.get("fps", 30))
+
+        cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(cam_index)
+        if not cap.isOpened():
+            self.logger.warning(f"真实相机打开失败: index={cam_index}")
+            self._real_cam = None
+            return
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS, fps)
+        self._real_cam = cap
+        self.logger.info(f"真实相机初始化完成: index={cam_index}, size={width}x{height}, fps={fps}")
+
+    def _read_real_camera_frame(self):
+        """从真实相机读取一帧。"""
+        if self._real_cam is None:
+            raise RuntimeError("真实相机未初始化")
+        with self._camera_lock:
+            ok, frame = self._real_cam.read()
+        if not ok or frame is None:
+            raise RuntimeError("真实相机读帧失败")
+        return frame.copy()
+
+    def _get_current_frame(self):
+        """统一取帧入口：sim读取VisionCaptureApi，real_mocap读取真实相机。"""
+        if self.run_mode == "sim":
+            if self.vis is None or not hasattr(self.vis, "Img") or len(getattr(self.vis, "Img", [])) == 0:
+                raise RuntimeError("sim模式图像源不可用，请检查VisionCaptureApi")
+            frame = self.vis.Img[0]
+            if frame is None:
+                raise RuntimeError("sim模式图像源尚未就绪")
+            return frame.copy()
+
+        if self._image_source_mode == "opencv":
+            return self._read_real_camera_frame()
+
+        raise RuntimeError(f"不支持的图像源模式: {self._image_source_mode}")
+
+    def _install_motion_safety_guards(self):
+        """在飞控对象上安装统一安全出口，拦截速度/位置/降落指令。"""
+        if self._safety_guards_installed:
+            return
+        if not self.MavList:
+            return
+
+        mav = self.MavList[0]
+        original_send_vel_frd = getattr(mav, "SendVelFRD", None)
+        original_send_pos_ned = getattr(mav, "SendPosNED", None)
+        original_send_pos_ned_no_yaw = getattr(mav, "SendPosNEDNoYaw", None)
+        original_send_pos_ned_ext = getattr(mav, "SendPosNEDExt", None)
+        original_send_land = getattr(mav, "sendMavLand", None)
+
+        if not callable(original_send_vel_frd) or not callable(original_send_pos_ned):
+            self.logger.warning("飞控对象缺少必要控制接口，安全出口未安装")
+            return
+
+        def _clamp(value, low, high):
+            return low if value < low else (high if value > high else value)
+
+        def _current_mode():
+            return (getattr(self, "_safety_motion_mode", "generic") or "generic").lower()
+
+        def _current_limits():
+            mode = _current_mode()
+            limits = self._safety_cfg.get("motion_limits", {})
+            return limits.get(mode, limits.get("generic", {"xy": 0.8, "z": 0.35, "yawrate_deg": 45.0}))
+
+        def _warn(reason, detail=""):
+            msg = f"[SAFETY] {reason}"
+            if detail:
+                msg = f"{msg}: {detail}"
+            self.logger.warning(msg)
+
+        def _timeout_active():
+            start_ts = getattr(self, "_safety_task_start_ts", None)
+            if start_ts is None:
+                return False
+            return (time.monotonic() - float(start_ts)) > float(self._safety_cfg.get("task_timeout_s", 60.0))
+
+        def _send_hover():
+            return original_send_vel_frd(0.0, 0.0, 0.0, 0.0)
+
+        def _project_after_velocity(vx, vy, vz):
+            roll, pitch, yaw = mav.uavAngEular[0], mav.uavAngEular[1], mav.uavAngEular[2]
+            dt = float(self._safety_cfg.get("projection_dt_s", 0.35))
+            dx_ned, dy_ned, dz_ned = b2n(vx * dt, vy * dt, vz * dt, roll, pitch, yaw)
+            cur_x, cur_y, cur_z = float(mav.uavPosNED[0]), float(mav.uavPosNED[1]), float(mav.uavPosNED[2])
+            return np.array([cur_x + dx_ned, cur_y + dy_ned, cur_z + dz_ned], dtype=float)
+
+        def _check_fence(projected_pos, label):
+            if not bool(self._safety_cfg.get("enable_space_fence", True)):
+                return True
+            home = getattr(self, "_home_pos_ned", None)
+            if home is None:
+                return True
+            radius = float(np.linalg.norm(projected_pos[:2] - home[:2]))
+            alt_ned = float(projected_pos[2])
+            if radius > float(self._safety_cfg.get("max_radius_m", 3.0)):
+                _warn("空间围栏触发", f"{label} radius={radius:.2f}m > {self._safety_cfg['max_radius_m']:.2f}m")
+                _send_hover()
+                return False
+            if alt_ned < float(self._safety_cfg.get("alt_ned_min", -1.8)) or alt_ned > float(self._safety_cfg.get("alt_ned_max", -0.3)):
+                _warn("高度围栏触发", f"{label} alt_ned={alt_ned:.2f} outside [{self._safety_cfg['alt_ned_min']:.2f},{self._safety_cfg['alt_ned_max']:.2f}]")
+                _send_hover()
+                return False
+            return True
+
+        def guarded_send_vel_frd(vx=0, vy=0, vz=0, yawrate=0):
+            if not bool(self._safety_cfg.get("enabled", True)):
+                return original_send_vel_frd(vx, vy, vz, yawrate)
+
+            if _timeout_active():
+                _warn("任务超时", f"mode={_current_mode()} -> 悬停")
+                return _send_hover()
+
+            limits = _current_limits()
+            xy_limit = float(limits.get("xy", 0.8))
+            z_limit = float(limits.get("z", 0.35))
+            yaw_limit = math.radians(float(limits.get("yawrate_deg", 45.0)))
+
+            clamped_vx = _clamp(float(vx), -xy_limit, xy_limit)
+            clamped_vy = _clamp(float(vy), -xy_limit, xy_limit)
+            clamped_vz = _clamp(float(vz), -z_limit, z_limit)
+            clamped_yawrate = _clamp(float(yawrate), -yaw_limit, yaw_limit)
+            if (
+                clamped_vx != float(vx)
+                or clamped_vy != float(vy)
+                or clamped_vz != float(vz)
+                or clamped_yawrate != float(yawrate)
+            ):
+                _warn(
+                    "速度限幅触发",
+                    f"mode={_current_mode()} cmd=({vx:.3f},{vy:.3f},{vz:.3f},{yawrate:.3f}) -> ({clamped_vx:.3f},{clamped_vy:.3f},{clamped_vz:.3f},{clamped_yawrate:.3f})"
+                )
+
+            projected = _project_after_velocity(clamped_vx, clamped_vy, clamped_vz)
+            if not _check_fence(projected, f"mode={_current_mode()}"):
+                return False
+            return original_send_vel_frd(clamped_vx, clamped_vy, clamped_vz, clamped_yawrate)
+
+        def guarded_send_pos_ned(x=math.nan, y=math.nan, z=math.nan, yaw=math.nan):
+            if not bool(self._safety_cfg.get("enabled", True)):
+                return original_send_pos_ned(x, y, z, yaw)
+
+            if _timeout_active():
+                _warn("任务超时", f"mode={_current_mode()} -> 悬停")
+                return _send_hover()
+
+            try:
+                target = np.array([float(x), float(y), float(z)], dtype=float)
+            except Exception:
+                _warn("位置指令参数非法", f"mode={_current_mode()} target=({x},{y},{z})")
+                return _send_hover()
+
+            if not _check_fence(target, f"mode={_current_mode()}"):
+                return False
+            return original_send_pos_ned(x, y, z, yaw)
+
+        def guarded_send_pos_ned_no_yaw(x=math.nan, y=math.nan, z=math.nan):
+            cur_yaw = float(mav.uavAngEular[2])
+            return guarded_send_pos_ned(x, y, z, cur_yaw)
+
+        def guarded_send_pos_ned_ext(x=math.nan, y=math.nan, z=math.nan, mode=3, isNED=True):
+            cur_yaw = float(mav.uavAngEular[2])
+            return guarded_send_pos_ned(x, y, z, cur_yaw)
+
+        def guarded_send_land(xM, yM, zM):
+            if not bool(self._safety_cfg.get("enabled", True)):
+                return original_send_land(xM, yM, zM)
+            if _timeout_active():
+                _warn("任务超时", "land被降级为悬停")
+                return _send_hover()
+            return original_send_land(xM, yM, zM)
+
+        mav.SendVelFRD = guarded_send_vel_frd
+        mav.SendPosNED = guarded_send_pos_ned
+        if callable(original_send_pos_ned_no_yaw):
+            mav.SendPosNEDNoYaw = guarded_send_pos_ned_no_yaw
+        if callable(original_send_pos_ned_ext):
+            mav.SendPosNEDExt = guarded_send_pos_ned_ext
+        if callable(original_send_land):
+            mav.sendMavLand = guarded_send_land
+
+        self._safety_guards_installed = True
+
+    def get_safety_summary(self):
+        limits = self._safety_cfg.get("motion_limits", {})
+        return {
+            "enabled": bool(self._safety_cfg.get("enabled", True)),
+            "enable_space_fence": bool(self._safety_cfg.get("enable_space_fence", True)),
+            "radius_m": float(self._safety_cfg.get("max_radius_m", 3.0)),
+            "timeout_s": float(self._safety_cfg.get("task_timeout_s", 60.0)),
+            "alt_ned": [float(self._safety_cfg.get("alt_ned_min", -1.8)), float(self._safety_cfg.get("alt_ned_max", -0.3))],
+            "limits": limits,
+            "single_vehicle_only": bool(self._safety_cfg.get("single_vehicle_only", True)),
+        }
+
+    def set_safety_motion_mode(self, mode: str):
+        """设置当前动作模式，用于选择不同的速度上限。"""
+        self._safety_motion_mode = (mode or "generic").lower()
+
+    def set_task_start_timestamp(self, start_ts=None):
+        """标记当前任务起点，用于统一60秒任务超时。"""
+        self._safety_task_start_ts = float(start_ts if start_ts is not None else time.monotonic())
+
+    def set_mocap_pose_provider(self, provider):
+        """注入动捕位姿回调: provider() -> (x,y,z,roll,pitch,yaw)。"""
+        self._mocap_pose_provider = provider
+
+    def mocap_to_ned_pose(self, pose):
+        """动捕坐标转NED: 输入(x,y,z,roll,pitch,yaw)，输出(n,e,d,roll,pitch,yaw)。"""
+        if pose is None or len(pose) < 6:
+            raise ValueError("mocap pose长度不足，需至少6个元素")
+
+        x_raw, y_raw, z_raw, roll, pitch, yaw = [float(v) for v in pose[:6]]
+        axis_map = {"x": x_raw, "y": y_raw, "z": z_raw}
+        cfg = self._mocap_cfg
+
+        north = float(cfg["x_sign"]) * axis_map[str(cfg["x_axis"]).lower()]
+        east = float(cfg["y_sign"]) * axis_map[str(cfg["y_axis"]).lower()]
+        up = float(cfg["z_sign"]) * axis_map[str(cfg["z_axis"]).lower()]
+
+        # ENU/实验室up转NED的down
+        down = -up
+
+        pos_offset = cfg.get("pos_offset_ned", [0.0, 0.0, 0.0])
+        n = north + float(pos_offset[0])
+        e = east + float(pos_offset[1])
+        d = down + float(pos_offset[2])
+
+        rpy_offset = cfg.get("rpy_offset_rad", [0.0, 0.0, 0.0])
+        roll = roll + float(rpy_offset[0])
+        pitch = pitch + float(rpy_offset[1])
+        yaw = yaw + float(rpy_offset[2])
+
+        return n, e, d, roll, pitch, yaw
+
+    def preflight_check(self):
+        """启动预检：链路/状态检查，返回结构化结果。"""
+        checks = []
+
+        has_mav = bool(self.MavList) and callable(getattr(self.MavList[0], "InitMavLoop", None))
+        checks.append({"name": "mavlink", "ok": has_mav, "detail": "Mavlink控制对象可用" if has_mav else "Mavlink控制对象不可用"})
+
+        single_ok = (self.VehilceNum == 1)
+        checks.append({"name": "single_vehicle", "ok": single_ok, "detail": f"VehilceNum={self.VehilceNum}"})
+
+        state_ok = False
+        if has_mav:
+            try:
+                pos = np.array(self.MavList[0].uavPosNED, dtype=float)
+                ang = np.array(self.MavList[0].uavAngEular, dtype=float)
+                state_ok = np.isfinite(pos).all() and np.isfinite(ang).all()
+            except Exception:
+                state_ok = False
+        checks.append({"name": "state", "ok": state_ok, "detail": "位姿状态可读" if state_ok else "位姿状态不可读"})
+
+        if self.run_mode == "sim":
+            img_ok = False
+            try:
+                _ = self._get_current_frame()
+                img_ok = True
+            except Exception:
+                img_ok = False
+            checks.append({"name": "image_source", "ok": img_ok, "detail": "仿真图像链路可用" if img_ok else "仿真图像链路不可用"})
+        else:
+            provider_ok = callable(self._mocap_pose_provider)
+            checks.append({"name": "mocap_provider", "ok": provider_ok, "detail": "已注入动捕位姿回调" if provider_ok else "未注入动捕位姿回调"})
+
+            # real_mocap预检补充：桥接链路可用性（首包可转换且可注入飞控）
+            bridge_ready_ok = False
+            bridge_detail = "未执行桥接首包检查"
+            if provider_ok and has_mav:
+                try:
+                    pose = self._mocap_pose_provider()
+                    if not pose or len(pose) < 6:
+                        bridge_detail = "动捕位姿回调首包无效"
+                    else:
+                        n, e, d, roll, pitch, yaw = self.mocap_to_ned_pose(pose)
+                        sent = self._send_vision_position(n, e, d, roll, pitch, yaw)
+                        if sent:
+                            bridge_ready_ok = True
+                            bridge_detail = "桥接链路可用(首包发送成功)"
+                        else:
+                            bridge_detail = "桥接链路不可用: 未找到外部位姿注入接口"
+                except Exception as e:
+                    bridge_detail = f"桥接链路检查异常: {e}"
+            elif not provider_ok:
+                bridge_detail = "桥接链路不可用: 未注入动捕位姿回调"
+            elif not has_mav:
+                bridge_detail = "桥接链路不可用: Mavlink控制对象不可用"
+
+            checks.append({"name": "mocap_bridge", "ok": bridge_ready_ok, "detail": bridge_detail})
+
+        ok = all(item["ok"] for item in checks)
+        result = {
+            "ok": ok,
+            "run_mode": self.run_mode,
+            "checks": checks,
+        }
+        self.logger.info(f"预检结果: {result}")
+        return result
+
+    def _send_vision_position(self, x, y, z, roll, pitch, yaw):
+        """兼容不同飞控封装的外部位姿注入接口。"""
+        if not self.MavList:
+            return False
+        mav = self.MavList[0]
+        # 优先你要求的SendVisionPosition语义，同时兼容常见命名/参数签名
+        for name in ["SendVisionPosition", "sendVisionPosition", "vision_position_estimate_send"]:
+            fn = getattr(mav, name, None)
+            if not callable(fn):
+                continue
+            try:
+                fn(x, y, z, roll, pitch, yaw)
+                return True
+            except TypeError:
+                try:
+                    # 尝试 RflySim PX4MavCtrlV4 常用的 4 参数签名 (x, y, z, yaw)
+                    fn(x, y, z, yaw)
+                    return True
+                except TypeError:
+                    try:
+                        # 尝试带时间戳的 7 参数签名
+                        usec = int(time.time() * 1_000_000)
+                        fn(usec, x, y, z, roll, pitch, yaw)
+                        return True
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return False
+
+    def start_mocap_bridge(self, hz=30.0):
+        """启动动捕位姿桥接线程（仅real_mocap模式）。"""
+        if self.run_mode != "real_mocap":
+            self.logger.info("start_mocap_bridge跳过: 当前非real_mocap模式")
+            return True
+        if self._mocap_bridge_running:
+            self.logger.info("动捕桥接线程已在运行")
+            return True
+        if not callable(self._mocap_pose_provider):
+            self.logger.warning("启动动捕桥接失败: 未注入动捕位姿回调")
+            return False
+
+        # 启动前做一次首包硬校验：确保位姿可读且存在外部位姿注入接口。
+        try:
+            pose = self._mocap_pose_provider()
+            if not pose or len(pose) < 6:
+                self.logger.warning("启动动捕桥接失败: 动捕位姿回调返回无效首包")
+                return False
+            n, e, d, roll, pitch, yaw = self.mocap_to_ned_pose(pose)
+            sent = self._send_vision_position(n, e, d, roll, pitch, yaw)
+            if not sent:
+                self.logger.warning("启动动捕桥接失败: 未找到外部位姿注入接口")
+                return False
+            self.logger.info("动捕桥接首包校验通过")
+        except Exception as e:
+            self.logger.warning(f"启动动捕桥接失败: 首包校验异常: {e}")
+            return False
+
+        period = max(1.0 / float(hz), 0.01)
+        self._mocap_bridge_stop_event.clear()
+
+        def _worker():
+            self.logger.info(f"动捕桥接线程启动: hz={hz}")
+            try:
+                while not self._mocap_bridge_stop_event.is_set():
+                    try:
+                        pose = self._mocap_pose_provider()
+                        if not pose or len(pose) < 6:
+                            time.sleep(period)
+                            continue
+                        n, e, d, roll, pitch, yaw = self.mocap_to_ned_pose(pose)
+                        sent = self._send_vision_position(n, e, d, roll, pitch, yaw)
+                        if not sent:
+                            self.logger.warning("动捕桥接发送失败: 未找到外部位姿注入接口")
+                            break
+                    except Exception as e:
+                        self.logger.warning(f"动捕桥接异常: {e}")
+                    time.sleep(period)
+            finally:
+                self._mocap_bridge_running = False
+                self.logger.info("动捕桥接线程已退出")
+
+        self._mocap_bridge_thread = threading.Thread(target=_worker, name="mocap_bridge", daemon=True)
+        self._mocap_bridge_running = True
+        self._mocap_bridge_thread.start()
+        return True
+
+    def stop_mocap_bridge(self):
+        """停止动捕位姿桥接线程。"""
+        if not self._mocap_bridge_running:
+            return
+        self._mocap_bridge_stop_event.set()
+        if self._mocap_bridge_thread is not None:
+            self._mocap_bridge_thread.join(timeout=1.5)
+        self._mocap_bridge_thread = None
+        self._mocap_bridge_running = False
+
+    def _run_yolo_on_frame(self, frame_bgr, object_names=""):
+        """对给定BGR帧执行一次YOLO检测并返回统一结果。"""
+        start_ts = time.time()
+        with self._detect_lock:
+            results = self.yolo_model.track(frame_bgr, conf=self.CONF_THRESHOLD, save=False, verbose=False)
+
+        if not results:
+            img_raw = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+            return [], [], [], img_raw, frame_bgr.copy(), (time.time() - start_ts) * 1000.0
+
+        result = results[0]
+        boxes = result.boxes
+        names = result.names if hasattr(result, "names") else {}
+        obj_list, obj_locs, obj_logits = [], [], []
+        target_name = self._canonical_object_name(object_names)
+        target_compact = self._compact_label(target_name) if target_name else ""
+
+        if boxes is not None and len(boxes) > 0:
+            cls_ids = boxes.cls.detach().cpu().numpy().astype(int).tolist() if boxes.cls is not None else []
+            confs = boxes.conf.detach().cpu().numpy().tolist() if boxes.conf is not None else []
+            locs = boxes.xyxy.detach().cpu().numpy().tolist() if boxes.xyxy is not None else []
+
+            for idx, cls_id in enumerate(cls_ids):
+                if isinstance(names, dict):
+                    obj_name = names.get(cls_id, str(cls_id))
+                elif isinstance(names, list) and 0 <= cls_id < len(names):
+                    obj_name = names[cls_id]
+                else:
+                    obj_name = str(cls_id)
+                canonical_obj_name = self._canonical_object_name(obj_name)
+                obj_compact = self._compact_label(canonical_obj_name)
+                if target_name and canonical_obj_name != target_name and obj_compact != target_compact:
+                    continue
+                obj_list.append(obj_name)
+                obj_locs.append(locs[idx] if idx < len(locs) else [])
+                obj_logits.append(float(confs[idx]) if idx < len(confs) else 0.0)
+
+        plot_bgr = result.plot(masks=False)
+        img_with_box = Image.fromarray(cv2.cvtColor(plot_bgr, cv2.COLOR_BGR2RGB))
+        return obj_list, obj_locs, obj_logits, img_with_box, plot_bgr, (time.time() - start_ts) * 1000.0
+
+    def _draw_preview_overlay(self, frame_bgr, detect_ms, matched_count, status_text):
+        if not bool(self._preview_cfg.get("show_overlay", True)):
+            return frame_bgr
+        view = frame_bgr.copy()
+        target_name = self._preview_cfg.get("target_name", "") or "all"
+        lines = [
+            f"mode={self.run_mode} cam={self._real_camera_index}",
+            f"target={target_name} matched={matched_count}",
+            f"detect={detect_ms:.1f}ms ({self._preview_cfg.get('detect_hz', 8.0):.1f}Hz)",
+            f"status={status_text}",
+            "hotkeys: q=quit preview, s=save image",
+        ]
+        y = 24
+        for line in lines:
+            cv2.putText(view, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (40, 255, 40), 2, cv2.LINE_AA)
+            y += 24
+        return view
+
+    def start_realtime_preview(self):
+        """启动实飞实时预览线程（带YOLO检测叠加）。"""
+        if self._preview_running:
+            self.logger.info("实时预览已在运行")
+            return True
+        if self.run_mode != "real_mocap":
+            self.logger.info("start_realtime_preview跳过: 当前非real_mocap模式")
+            return True
+        if self._real_cam is None:
+            self.logger.warning("启动实时预览失败: 真实相机未初始化")
+            return False
+
+        detect_hz = float(self._preview_cfg.get("detect_hz", 8.0))
+        period = max(1.0 / detect_hz, 0.01)
+        target_name = self._preview_cfg.get("target_name", "")
+        window_name = self._preview_cfg.get("window_name", "RealCam YOLO Preview")
+        key_quit = ord(str(self._preview_cfg.get("hotkey_quit", "q"))[0].lower())
+        key_save = ord(str(self._preview_cfg.get("hotkey_save", "s"))[0].lower())
+
+        self._preview_stop_event.clear()
+        self._preview_last_status = "运行中"
+
+        def _worker():
+            self.logger.info(
+                f"实时预览线程启动: window={window_name}, detect_hz={detect_hz:.1f}, target={target_name or 'all'}"
+            )
+            while not self._preview_stop_event.is_set():
+                loop_start = time.time()
+                try:
+                    frame = self._read_real_camera_frame()
+                    obj_list, obj_locs, obj_logits, img_with_box, plot_bgr, cost_ms = self._run_yolo_on_frame(frame, target_name)
+                    self.last_detection_image = img_with_box
+                    self.last_detection_time = datetime.now()
+                    self.last_detection_has_object = len(obj_list) > 0
+                    self._preview_last_status = "检测正常" if obj_list else "未检测到目标"
+
+                    vis = self._draw_preview_overlay(
+                        plot_bgr,
+                        detect_ms=cost_ms,
+                        matched_count=len(obj_list),
+                        status_text=self._preview_last_status,
+                    )
+                    cv2.imshow(window_name, vis)
+
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == key_quit:
+                        self._preview_stop_event.set()
+                        self._preview_last_status = "用户关闭预览"
+                        self.logger.info("实时预览窗口收到退出按键")
+                        break
+                    if key == key_save:
+                        try:
+                            save_path = self.save_detection_image(use_latest=True)
+                            self.logger.info(f"实时预览热键保存图片: {save_path}")
+                        except Exception as e:
+                            self.logger.warning(f"实时预览热键保存失败: {e}")
+                except Exception as e:
+                    self._preview_last_status = f"预览异常: {e}"
+                    self.logger.warning(f"实时预览循环异常(已忽略，不影响飞控): {e}")
+
+                elapsed = time.time() - loop_start
+                if elapsed < period:
+                    time.sleep(period - elapsed)
+
+            try:
+                cv2.destroyWindow(window_name)
+            except Exception:
+                pass
+            self.logger.info("实时预览线程退出")
+
+        self._preview_thread = threading.Thread(target=_worker, name="realcam_preview", daemon=True)
+        self._preview_thread.start()
+        self._preview_running = True
+        return True
+
+    def stop_realtime_preview(self):
+        """停止实飞实时预览线程。"""
+        if not self._preview_running:
+            return
+        self._preview_stop_event.set()
+        if self._preview_thread is not None:
+            self._preview_thread.join(timeout=1.5)
+        self._preview_thread = None
+        self._preview_running = False
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+    def close_image_source(self):
+        """释放图像源资源。"""
+        self.stop_realtime_preview()
+        if self._real_cam is not None:
+            try:
+                self._real_cam.release()
+                self.logger.info("真实相机已释放")
+            except Exception:
+                pass
+            self._real_cam = None
 
     def _canonical_object_name(self, object_name):
         """
@@ -202,11 +928,14 @@ class BodyCommMavlink(object):
 
     def detect_yolo(self, object_names):
         # 使用YOLO模型进行目标检测
-        start_ts = time.time()
-        image = self.vis.Img[0].copy()
-        results = self.yolo_model.track(image, conf=self.CONF_THRESHOLD, save=False)
+        try:
+            image = self._get_current_frame()
+        except Exception as e:
+            self.logger.warning(f"detect_yolo取帧失败: {e}")
+            return [], [], [], None
+        obj_list, obj_locs, obj_logits, img_with_box, _plot_bgr, cost_ms = self._run_yolo_on_frame(image, object_names)
 
-        if not results:
+        if img_with_box is None:
             print("[warn] 未获得推理结果")
             self.last_detection_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             self.last_detection_time = datetime.now()
@@ -214,44 +943,11 @@ class BodyCommMavlink(object):
             self.logger.warning(f"detect_yolo无推理结果, target={object_names}")
             return [], [], [], self.last_detection_image
 
-        # 解析检测结果
-        result = results[0]
-        boxes = result.boxes
-        names = result.names if hasattr(result, "names") else {}
-        obj_list, obj_locs, obj_logits = [], [], []
-        target_name = self._canonical_object_name(object_names)
-        target_compact = self._compact_label(target_name) if target_name else ""
-
-        if boxes is not None and len(boxes) > 0:
-            cls_ids = boxes.cls.detach().cpu().numpy().astype(int).tolist() if boxes.cls is not None else []
-            confs = boxes.conf.detach().cpu().numpy().tolist() if boxes.conf is not None else []
-            locs = boxes.xyxy.detach().cpu().numpy().tolist() if boxes.xyxy is not None else []
-
-            for idx, cls_id in enumerate(cls_ids):
-                if isinstance(names, dict):
-                    obj_name = names.get(cls_id, str(cls_id))
-                elif isinstance(names, list) and 0 <= cls_id < len(names):
-                    obj_name = names[cls_id]
-                else:
-                    obj_name = str(cls_id)
-                # 当指定了目标名称时，仅返回匹配目标（双边归一化，避免drone/uav同义词漏检）
-                canonical_obj_name = self._canonical_object_name(obj_name)
-                obj_compact = self._compact_label(canonical_obj_name)
-                if target_name and canonical_obj_name != target_name and obj_compact != target_compact:
-                    continue
-                obj_list.append(obj_name)
-                obj_locs.append(locs[idx] if idx < len(locs) else [])
-                obj_logits.append(float(confs[idx]) if idx < len(confs) else 0.0)
-
-        plot_bgr = result.plot(masks=False)  # 带标注框的图像（BGR ndarray）
-        img_with_box = Image.fromarray(cv2.cvtColor(plot_bgr, cv2.COLOR_BGR2RGB))
-
         # 缓存最近一次检测可视化图，供保存函数直接使用
         self.last_detection_image = img_with_box
         self.last_detection_time = datetime.now()
         self.last_detection_has_object = len(obj_list) > 0
 
-        cost_ms = (time.time() - start_ts) * 1000.0
         self.logger.info(
             f"detect_yolo target={object_names} matched={len(obj_list)} elapsed_ms={cost_ms:.1f}"
         )
@@ -268,6 +964,8 @@ class BodyCommMavlink(object):
         mode=quick: 先看当前视野，若无目标再旋转搜索，找到首个目标即结束。
         mode=all: 旋转一整圈，统计目标总数和相对朝向角。
         """
+        prev_safety_mode = getattr(self, "_safety_motion_mode", "generic")
+        self.set_safety_motion_mode("search")
         canonical_name = self._canonical_object_name(object_names)
         mode = (mode or "quick").strip().lower()
         if mode not in ("quick", "all"):
@@ -367,14 +1065,23 @@ class BodyCommMavlink(object):
             "angles_deg": [],
             "summary": summary,
         }
+        
+        # 不可达分支，仅用于保持 finally 语义一致
+        
+        
 
     def search_object(self, object_names, mode="quick"):
         """
         兼容旧接口：返回布尔值（是否找到）。
         新增mode参数用于区分快速搜索与全景搜索。
         """
-        result = self.search_object_detail(object_names, mode=mode)
-        return bool(result.get("found", False))
+        prev_safety_mode = getattr(self, "_safety_motion_mode", "generic")
+        self.set_safety_motion_mode("search")
+        try:
+            result = self.search_object_detail(object_names, mode=mode)
+            return bool(result.get("found", False))
+        finally:
+            self.set_safety_motion_mode(prev_safety_mode)
 
     def cv2_to_base64(self, image, format='.png'):
         # 将OpenCV图像转换为Base64字符串
@@ -387,7 +1094,7 @@ class BodyCommMavlink(object):
     def look(self):
         # 获取前置摄像头的图像，并通过火山引擎LLM进行图像理解
         self.logger.info("调用look_function进行视觉描述")
-        rgb_image = self.vis.Img[0]
+        rgb_image = self._get_current_frame()
         base64_str = self.cv2_to_base64(rgb_image, ".png")
         response = self.llm_client.chat.completions.create(
             model="doubao-1-5-vision-pro-32k-250115",
@@ -1065,7 +1772,7 @@ class BodyCommMavlink(object):
 
         if img_with_box is None:
             # 无检测结果时仍保存当前原图（需求2.A）
-            img_with_box = self.vis.Img[0].copy()
+            img_with_box = self._get_current_frame()
             has_object = False
 
         if output_dir is None:

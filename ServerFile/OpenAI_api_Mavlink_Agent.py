@@ -102,6 +102,20 @@ class OpenAI_APIs(Des):
         ]
         self._emit_highlight_block("步骤结果", lines, ok=success)
 
+    def _reset_comm_task_timeout(self, clause: str = ""):
+        """在每个子句执行前重置通信层任务超时基准。"""
+        try:
+            comm_obj = getattr(self.search_object_function, "__self__", None)
+            if comm_obj is None:
+                return
+            reset_fn = getattr(comm_obj, "set_task_start_timestamp", None)
+            if callable(reset_fn):
+                reset_fn()
+                if clause:
+                    self.logger.info(f"重置通信层任务计时: clause={clause}")
+        except Exception as e:
+            self.logger.warning(f"重置通信层任务计时失败: {e}")
+
     def _handle_hard_rules(self, task: str):
         """
         极薄硬规则层：处理退出/急停与基础位移，其他语义交给LLM。
@@ -630,7 +644,7 @@ class OpenAI_APIs(Des):
 
         if code.strip():
             self._task_guard_state = {
-                "deadline": time.monotonic() + 45.0,
+                "deadline": time.monotonic() + 180.0,
                 "search_calls": 0,
                 "max_search_calls": 4,
                 "clause": clause,
@@ -913,6 +927,7 @@ class OpenAI_APIs(Des):
 
                 for idx, clause in enumerate(clauses, start=1):
                     self.logger.info(f"CLAUSE_START cmd_id={cmd_id} idx={idx}/{len(clauses)} clause={clause}")
+                    self._reset_comm_task_timeout(clause)
 
                     action, summary = self._handle_hard_rules(clause)
                     if action == "continue":
