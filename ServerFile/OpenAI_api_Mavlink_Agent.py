@@ -6,6 +6,7 @@
 import os
 import ast
 import time
+import json
 import openai
 import numpy as np
 import cv2
@@ -54,7 +55,21 @@ class OpenAI_APIs(Des):
         # 初始化聊天历史记录
         self.chatHistory = []
         self.logger = get_runtime_logger("agent")
-        self.logger.info("OpenAI_APIs 初始化完成")
+
+        # 读取 Config.json 获取硬规则开关
+        self.enable_hard_rule_routing = True
+        try:
+            config_path = os.path.join(os.path.dirname(__file__), 'Config.json')
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    content = re.sub(r'//.*', '', content)
+                    config_data = json.loads(content)
+                    self.enable_hard_rule_routing = config_data.get("agent_config", {}).get("enable_hard_rule_routing", True)
+        except Exception as e:
+            self.logger.warning(f"读取 Config.json 失败: {e}")
+
+        self.logger.info(f"OpenAI_APIs 初始化完成, enable_hard_rule_routing={self.enable_hard_rule_routing}")
 
     def _get_latest_result_cn(self, default_text: str = "执行完成"):
         """
@@ -118,7 +133,8 @@ class OpenAI_APIs(Des):
 
     def _handle_hard_rules(self, task: str):
         """
-        极薄硬规则层：处理退出/急停与基础位移，其他语义交给LLM。
+        全量硬规则层：处理退出/急停与各类基础动作模板。
+        如果 enable_hard_rule_routing 为 False，则仅保留退出和急停，其余全部交给LLM。
         返回(action, summary)
         action取值："continue" 表示已处理并进入下一轮；"pass" 表示交给LLM。
         """
@@ -126,12 +142,12 @@ class OpenAI_APIs(Des):
         if not text:
             return "continue", "空指令"
 
+        # 最高安全级别：无论开关是否打开，退出和急停始终生效
         if text.lower() in self.ExitList:
             print("对话结束，程序退出。")
             self.logger.info("用户主动退出")
             raise KeyboardInterrupt
 
-        # 急停硬规则：立即清零速度，避免模型生成延迟造成风险
         if re.search(r"急停|紧急停止|立即停止|stop\b", text, flags=re.IGNORECASE):
             try:
                 self.MavList[0].SendVelFRD(0, 0, 0, 0)
@@ -143,7 +159,13 @@ class OpenAI_APIs(Des):
                 print(f"紧急停止执行失败: {e}")
                 return "continue", "紧急停止失败"
 
-        # 基础位移硬规则：前后左右上下 + 米数，直接走确定性模板，避免LLM坐标映射偏差。
+        # 状态检查：如果硬规则路由关闭，则剩余动作交给LLM
+        if not getattr(self, 'enable_hard_rule_routing', True):
+            return "pass", "交由LLM处理"
+
+        # === 以下为受开关控制的本地硬规则路由 ===
+
+        # 1. 基础位移硬规则
         move_parsed = self._parse_body_move_clause(text)
         if move_parsed is not None:
             if move_parsed.get("type") == "move_invalid":
@@ -162,6 +184,46 @@ class OpenAI_APIs(Des):
                 return "continue", "基础位移执行完成"
             return "continue", "基础位移执行失败"
 
+        # 2. 转向硬规则
+        turn_parsed = self._parse_turn_clause(text)
+        if turn_parsed is not None:
+            ok = self._execute_turn_template(
+                sign=turn_parsed["sign"],
+                deg=turn_parsed["deg"],
+                turn_text=turn_parsed["turn_text"],
+            )
+            if ok:
+                return "continue", "转向执行完成"
+            return "continue", "转向执行失败"
+
+        # 3. 搜索硬规则
+        search_parsed = self._parse_search_clause(text)
+        if search_parsed is not None:
+            ok = self._execute_search_template(
+                object_name=search_parsed["object_name"],
+                mode=search_parsed["mode"],
+            )
+            if ok:
+                return "continue", self._get_latest_result_cn(default_text="搜索完成")
+            return "continue", self._get_latest_result_cn(default_text="搜索失败")
+
+        # 4. 靠近硬规则
+        approach_parsed = self._parse_approach_clause(text)
+        if approach_parsed is not None:
+            ok = self._execute_approach_template(approach_parsed["object_name"])
+            if ok:
+                return "continue", self._get_latest_result_cn(default_text="靠近完成")
+            return "continue", self._get_latest_result_cn(default_text="靠近失败")
+
+        # 5. 原地朝向硬规则
+        face_parsed = self._parse_face_object_clause(text)
+        if face_parsed is not None:
+            ok = self._execute_face_object_template(face_parsed["object_name"])
+            if ok:
+                return "continue", "朝向执行完成"
+            return "continue", "朝向执行失败"
+
+        # 都未命中则交由 LLM 处理
         return "pass", "交由LLM处理"
 
     def _guard_check_deadline(self):

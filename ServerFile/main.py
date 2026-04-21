@@ -6,23 +6,8 @@ sys.path.append(r"D:\Rflysim\RflySimAPIs\RflySimSDK\vision")
 from OpenAI_api_Mavlink_Agent import OpenAI_APIs
 from Communication_Mavlink import BodyCommMavlink
 from runtime_logger import init_runtime_logger, get_runtime_logger
+from MocapClient import OptiTrackClient
 
-
-def build_mock_mocap_pose_provider():
-    """构造一个最小可跑的动捕回调，用于未接入真实动捕时联调桥接链路。"""
-    t0 = time.monotonic()
-
-    def _provider():
-        t = time.monotonic() - t0
-        x = 0.0
-        y = 0.0
-        z = 1.0
-        roll = 0.0
-        pitch = 0.0
-        yaw = 0.2 * math.sin(0.3 * t)
-        return (x, y, z, roll, pitch, yaw)
-
-    return _provider
 
 if __name__ == '__main__':
     init_runtime_logger()
@@ -35,13 +20,6 @@ if __name__ == '__main__':
         logger.info("通信模块初始化完成")
         time.sleep(2)
 
-        # real_mocap模式下默认不注入mock；仅在配置显式允许时注入。
-        if getattr(Comm_api, "run_mode", "sim") == "real_mocap":
-            if bool(getattr(Comm_api, "is_mock_mocap_allowed", lambda: False)()):
-                Comm_api.set_mocap_pose_provider(build_mock_mocap_pose_provider())
-                logger.warning("real_mocap模式: allow_mock_mocap_for_debug=true，已注入mock位姿回调用于联调")
-            else:
-                logger.warning("real_mocap模式: 默认禁用mock位姿注入，请接入真实动捕回调或在Config中显式开启allow_mock_mocap_for_debug")
 
         # 2) 预检（链路/状态）
         preflight = Comm_api.preflight_check()
@@ -49,20 +27,34 @@ if __name__ == '__main__':
         if not bool(preflight.get("ok", False)):
             raise RuntimeError("启动预检失败，请先修复链路/状态问题")
 
-        # 3) 启动位姿桥接（实飞模式）
-        if getattr(Comm_api, "run_mode", "sim") == "real_mocap":
+        # 3) 启动位姿桥接与实时预览（实飞模式）
+        run_mode = getattr(Comm_api, "run_mode", "sim")
+        opti_client = None
+        if run_mode == "real_mocap":
+            mocap_cfg = getattr(Comm_api, "_runtime_cfg", {}).get("mocap", {}) if getattr(Comm_api, "_runtime_cfg", {}) else {}
+            mocap_ip = mocap_cfg.get("multicast_ip", "239.255.42.99")
+            mocap_port = mocap_cfg.get("port", 1511)
+            rb_id = mocap_cfg.get("rigid_body_id", 1)
+
+            opti_client = OptiTrackClient(multicast_ip=mocap_ip, port=mocap_port, rigid_body_id=rb_id)
+            opti_client.start()
+            
+            # 注入纯Python动捕回调
+            Comm_api.set_mocap_pose_provider(opti_client.get_latest_pose)
+
             bridge_ok = Comm_api.start_mocap_bridge(hz=30.0)
             if not bridge_ok:
                 raise RuntimeError("real_mocap模式下动捕桥接启动失败")
             logger.info("real_mocap模式: 动捕桥接已启动")
 
+        if run_mode in ("real_mocap", "real_optical"):
             preview_cfg = getattr(Comm_api, "_preview_cfg", {}) if hasattr(Comm_api, "_preview_cfg") else {}
             if bool(preview_cfg.get("auto_start", True)):
                 preview_ok = Comm_api.start_realtime_preview()
                 if not preview_ok:
-                    logger.warning("real_mocap模式: 实时预览启动失败，将继续执行飞控任务")
+                    logger.warning(f"{run_mode}模式: 实时预览启动失败，将继续执行飞控任务")
                 else:
-                    logger.info("real_mocap模式: 实时预览已启动")
+                    logger.info(f"{run_mode}模式: 实时预览已启动")
 
         # 4) 进入交互任务循环
         MavList, VehilceNum, Error2UE4Map = Comm_api.GetBodyMavList()
@@ -83,6 +75,11 @@ if __name__ == '__main__':
         logger.info("进入主控制循环")
         chat_api.Main_Control()
     finally:
+        if 'opti_client' in locals() and opti_client is not None:
+            try:
+                opti_client.stop()
+            except Exception:
+                pass
         if Comm_api is not None:
             try:
                 Comm_api.stop_mocap_bridge()

@@ -42,6 +42,7 @@ class BodyCommMavlink(object):
         self._preview_stop_event = threading.Event()
         self._preview_last_status = "未启动"
         self._real_camera_index = 0
+        self._real_mavlink_target_ip = self._load_real_mavlink_target_ip()
         # 检查是否使用GPU
         if torch.cuda.is_available():
             print("use_gpu")
@@ -60,7 +61,8 @@ class BodyCommMavlink(object):
         )
 
         # 加载YOLOE模型
-        self.yolo_model = YOLOE("i:/drone_project/实验6-7_无人机视觉语言控制实验/1.软件在环实验/ServerFile/weights/best.pt")
+        weights_path = os.path.join(os.path.dirname(__file__), "weights", "best.pt")
+        self.yolo_model = YOLOE(weights_path)
         self.CONF_THRESHOLD = 0.25  # 置信度阈值
         self.NMS_THRESHOLD = 0.45   # NMS阈值
         self.last_detection_image = None
@@ -81,11 +83,11 @@ class BodyCommMavlink(object):
             "alt_ned_min": -1.8,
             "alt_ned_max": -0.3,
             "motion_limits": {
-                "generic": {"xy": 0.8, "z": 0.35, "yawrate_deg": 45.0},
-                "search": {"xy": 0.8, "z": 0.35, "yawrate_deg": 45.0},
-                "face": {"xy": 0.0, "z": 0.0, "yawrate_deg": 45.0},
-                "approach": {"xy": 1.0, "z": 0.35, "yawrate_deg": 45.0},
-                "strike": {"xy": 1.2, "z": 0.35, "yawrate_deg": 60.0},
+                "generic": {"xy": 1.5, "z": 0.8, "yawrate_deg": 60.0},
+                "search": {"xy": 1.5, "z": 0.8, "yawrate_deg": 60.0},
+                "face": {"xy": 0.0, "z": 0.0, "yawrate_deg": 60.0},
+                "approach": {"xy": 1.8, "z": 0.8, "yawrate_deg": 60.0},
+                "strike": {"xy": 2.5, "z": 0.8, "yawrate_deg": 90.0},
                 "land": {"xy": 0.0, "z": 0.0, "yawrate_deg": 0.0},
             },
         }
@@ -122,9 +124,9 @@ class BodyCommMavlink(object):
             self.vis.sendReqToUE4(0, TargetIP)
             self.vis.startImgCap()
         else:
-            TargetIP = "127.0.0.1"
+            TargetIP = self._real_mavlink_target_ip
             self._init_real_camera_from_config()
-            self.logger.warning("run_mode=real_mocap: 已启用真实相机取流与动捕桥接模式")
+            self.logger.warning(f"run_mode={self.run_mode}: 已启用真实相机取流, target_ip={TargetIP}")
 
         # 初始化无人机列表
         self.VehilceNum = 1  # 无人机数量
@@ -135,7 +137,7 @@ class BodyCommMavlink(object):
                 TargetIP = self.req.getSimIpID(CopterID)
                 self.req.sendReSimIP(CopterID)
             else:
-                TargetIP = "127.0.0.1"
+                TargetIP = self._real_mavlink_target_ip
             time.sleep(1)
             self.MavList = self.MavList + [PX4MavCtrl.PX4MavCtrler(CopterID, TargetIP)]  # 创建无人机控制器实例并添加到列表中
         time.sleep(2)
@@ -186,25 +188,13 @@ class BodyCommMavlink(object):
         try:
             cfg = self._runtime_cfg if isinstance(self._runtime_cfg, dict) else {}
             mode = str(cfg.get("run_mode", "sim")).strip().lower()
-            if mode in ("sim", "real_mocap"):
+            if mode in ("sim", "real_mocap", "real_optical"):
                 return mode
             self.logger.warning(f"Config.json run_mode非法({mode})，回退sim")
             return "sim"
         except Exception as e:
             self.logger.warning(f"解析run_mode失败，回退sim: {e}")
             return "sim"
-
-    def is_mock_mocap_allowed(self):
-        """是否允许real_mocap模式下自动注入mock动捕回调（默认False）。"""
-        cfg = self._runtime_cfg if isinstance(self._runtime_cfg, dict) else {}
-        raw = cfg.get("allow_mock_mocap_for_debug", False)
-        if isinstance(raw, bool):
-            return raw
-        if isinstance(raw, str):
-            return raw.strip().lower() in ("1", "true", "yes", "on")
-        if isinstance(raw, (int, float)):
-            return bool(raw)
-        return False
 
     def _load_realtime_preview_config(self):
         """读取实飞实时预览配置。"""
@@ -242,6 +232,13 @@ class BodyCommMavlink(object):
             "hotkey_quit": str(preview.get("hotkey_quit", "q")).strip().lower()[:1] or "q",
         }
 
+    def _load_real_mavlink_target_ip(self):
+        """读取实飞模式下MAVLink目标IP。"""
+        cfg = self._runtime_cfg if isinstance(self._runtime_cfg, dict) else {}
+        real_cfg = cfg.get("real_mavlink", {}) if isinstance(cfg.get("real_mavlink", {}), dict) else {}
+        ip = str(real_cfg.get("target_ip", "192.168.151.107")).strip()
+        return ip or "192.168.151.107"
+
     def _init_real_camera_from_config(self):
         """实飞模式初始化真实相机。"""
         cfg = self._runtime_cfg if isinstance(self._runtime_cfg, dict) else {}
@@ -253,7 +250,11 @@ class BodyCommMavlink(object):
             self.logger.warning(f"暂不支持的real_camera.source={source}，回退opencv")
             self._image_source_mode = "opencv"
 
-        cam_index = int(cam_cfg.get("device_index", 0))
+        raw_index = cam_cfg.get("device_index", 0)
+        try:
+            cam_index = int(raw_index)
+        except ValueError:
+            cam_index = str(raw_index)
         self._real_camera_index = cam_index
         width = int(cam_cfg.get("width", 640))
         height = int(cam_cfg.get("height", 480))
@@ -325,7 +326,7 @@ class BodyCommMavlink(object):
         def _current_limits():
             mode = _current_mode()
             limits = self._safety_cfg.get("motion_limits", {})
-            return limits.get(mode, limits.get("generic", {"xy": 0.8, "z": 0.35, "yawrate_deg": 45.0}))
+            return limits.get(mode, limits.get("generic", {"xy": 1.5, "z": 0.8, "yawrate_deg": 60.0}))
 
         def _warn(reason, detail=""):
             msg = f"[SAFETY] {reason}"
@@ -525,7 +526,7 @@ class BodyCommMavlink(object):
             except Exception:
                 img_ok = False
             checks.append({"name": "image_source", "ok": img_ok, "detail": "仿真图像链路可用" if img_ok else "仿真图像链路不可用"})
-        else:
+        elif self.run_mode == "real_mocap":
             provider_ok = callable(self._mocap_pose_provider)
             checks.append({"name": "mocap_provider", "ok": provider_ok, "detail": "已注入动捕位姿回调" if provider_ok else "未注入动捕位姿回调"})
 
@@ -553,6 +554,8 @@ class BodyCommMavlink(object):
                 bridge_detail = "桥接链路不可用: Mavlink控制对象不可用"
 
             checks.append({"name": "mocap_bridge", "ok": bridge_ready_ok, "detail": bridge_detail})
+        elif self.run_mode == "real_optical":
+            checks.append({"name": "optical_flow", "ok": True, "detail": "跳过动捕自检，使用飞控底层光流/GPS"})
 
         ok = all(item["ok"] for item in checks)
         result = {
@@ -724,8 +727,8 @@ class BodyCommMavlink(object):
         if self._preview_running:
             self.logger.info("实时预览已在运行")
             return True
-        if self.run_mode != "real_mocap":
-            self.logger.info("start_realtime_preview跳过: 当前非real_mocap模式")
+        if self.run_mode not in ("real_mocap", "real_optical"):
+            self.logger.info("start_realtime_preview跳过: 当前非实飞模式")
             return True
         if self._real_cam is None:
             self.logger.warning("启动实时预览失败: 真实相机未初始化")

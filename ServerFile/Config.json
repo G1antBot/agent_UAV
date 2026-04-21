@@ -1,6 +1,17 @@
 {
-    "run_mode": "real_mocap", // 运行模式: sim(软件在环仿真) / real_mocap(实飞+动捕)
-    "allow_mock_mocap_for_debug": true, // 是否允许real_mocap下自动注入mock动捕回调（默认关闭）
+    "run_mode": "real_optical", // 运行模式: sim(软件仿真) / real_mocap(实飞带室内部署动捕) / real_optical(实飞无动捕，依赖飞控底层的光流或GPS)
+    "real_mavlink": {
+        "target_ip": "192.168.151.107" // 实飞模式下目标无人机IP
+    },
+    "agent_config": {
+        "enable_hard_rule_routing": true // 启用规则路由(优先匹配急停等硬规则)，设为false则所有指令走纯LLM
+    },
+    "mocap": {
+        "enabled": true,
+        "multicast_ip": "239.255.42.99",
+        "port": 1511,
+        "rigid_body_id": 1 // Motive里给无人机建立刚体时分配的ID
+    },
     "real_camera": {
         "source": "opencv", // real_mocap下图像来源: opencv
         "device_index": 0, // 本地相机索引
