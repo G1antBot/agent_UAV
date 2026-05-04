@@ -4,7 +4,7 @@ import math
 import sys
 sys.path.append(r"D:\Rflysim\RflySimAPIs\RflySimSDK\vision")
 from OpenAI_api_Mavlink_Agent import OpenAI_APIs
-from Communication_Mavlink import BodyCommMavlink
+from Communication_Mavlink import  BodyCommMavlink
 from runtime_logger import init_runtime_logger, get_runtime_logger
 from MocapClient import OptiTrackClient
 
@@ -55,9 +55,20 @@ if __name__ == '__main__':
                     logger.warning(f"{run_mode}模式: 实时预览启动失败，将继续执行飞控任务")
                 else:
                     logger.info(f"{run_mode}模式: 实时预览已启动")
+        elif run_mode == "sim":
+            sim_preview_cfg = getattr(Comm_api, "_sim_preview_cfg", {}) if hasattr(Comm_api, "_sim_preview_cfg") else {}
+            if bool(sim_preview_cfg.get("auto_start", True)):
+                preview_ok = Comm_api.start_sim_preview()
+                if not preview_ok:
+                    logger.warning("sim模式: 实时预览启动失败，将继续执行飞控任务")
+                else:
+                    logger.info("sim模式: 实时预览已启动")
 
         # 4) 进入交互任务循环
         MavList, VehilceNum, Error2UE4Map = Comm_api.GetBodyMavList()
+        if len(MavList) > 0:
+            MavList[0].move_with_speed = Comm_api.move_with_speed
+
         logger.info(f"无人机信息: VehilceNum={VehilceNum}, Error2UE4Map_len={len(Error2UE4Map)}")
         logger.info(f"安全摘要: {Comm_api.get_safety_summary()}")
 
@@ -72,6 +83,11 @@ if __name__ == '__main__':
             Comm_api.face_objective_to_target,
             Comm_api.strike_objective_to_target
         )
+        
+        # 建立底层中断桥梁
+        if hasattr(Comm_api, 'set_interrupt_check'):
+            Comm_api.set_interrupt_check(lambda: getattr(chat_api, "is_interrupted", False))
+
         logger.info("进入主控制循环")
         chat_api.Main_Control()
     finally:

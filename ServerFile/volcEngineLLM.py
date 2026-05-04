@@ -4,11 +4,11 @@ from runtime_logger import get_runtime_logger
 
 
 class VolcEngineFakeHFModel:
-    def __init__(self):
+    def __init__(self, api_key=None, api_url=None, model_id=None):
         # 初始化API密钥、API地址和模型ID
-        self.api_key = "24572520-5c64-4470-8c3d-5ecb84781725"  # 火山引擎API密钥
-        self.api_url = "https://ark.cn-beijing.volces.com/api/v3/chat/completions"  # 火山引擎API地址
-        self.model_id = "deepseek-v3-250324"  # 使用的模型ID
+        self.api_key = api_key or "24572520-5c64-4470-8c3d-5ecb84781725"  # 火山引擎API密钥
+        self.api_url = api_url or "https://ark.cn-beijing.volces.com/api/v3/chat/completions"  # 火山引擎API地址
+        self.model_id = model_id or "deepseek-v3-250324"  # 使用的模型ID
         self.logger = get_runtime_logger("llm")
 
     def _normalize_code(self, text: str) -> str:

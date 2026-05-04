@@ -1,10 +1,18 @@
 {
-    "run_mode": "real_optical", // 运行模式: sim(软件仿真) / real_mocap(实飞带室内部署动捕) / real_optical(实飞无动捕，依赖飞控底层的光流或GPS)
+    "run_mode": "sim", // 运行模式: sim(软件仿真) / real_mocap(实飞带室内部署动捕) / real_optical(实飞无动捕，依赖飞控底层的光流或GPS)
     "real_mavlink": {
         "target_ip": "192.168.151.107" // 实飞模式下目标无人机IP
     },
     "agent_config": {
-        "enable_hard_rule_routing": true // 启用规则路由(优先匹配急停等硬规则)，设为false则所有指令走纯LLM
+        "enable_hard_rule_routing": true, // 启用规则路由(优先匹配急停等硬规则)，设为false则所有指令走纯LLM
+        "semantic_distance_map": {
+            "大幅度": 0.5,
+            "多一点": 0.5,
+            "靠近一点点": 0.3,
+            "一点点": 0.3,
+            "稍微挪一点": 0.2,
+            "稍微": 0.2
+        }
     },
     "mocap": {
         "enabled": true,
@@ -27,6 +35,14 @@
             "hotkey_quit": "q", // 关闭预览窗口
             "hotkey_save": "s" // 保存当前检测图
         }
+    },
+    "sim_preview": {
+        "auto_start": true, // sim启动后自动开启实时预览
+        "window_name": "Sim YOLO Preview",
+        "detect_hz": 10.0, // YOLO检测频率(Hz)
+        "target_name": "", // 空字符串=显示全部类别
+        "hotkey_quit": "q", // 关闭预览窗口
+        "hotkey_save": "s" // 保存当前检测图
     },
     "VisionSensors":[
         {

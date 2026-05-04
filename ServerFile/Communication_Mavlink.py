@@ -30,6 +30,8 @@ from Coordinate_Transformation import body_to_ned as b2n
 class BodyCommMavlink(object):
     def __init__(self):
         self.logger = get_runtime_logger("comm")
+        self.MavList = []
+        self.VehilceNum = 0
         self._runtime_cfg = self._load_runtime_config()
         self.run_mode = self._load_run_mode_from_config()
         self._image_source_mode = "visioncapture" if self.run_mode == "sim" else "opencv"
@@ -37,10 +39,14 @@ class BodyCommMavlink(object):
         self._camera_lock = threading.Lock()
         self._detect_lock = threading.Lock()
         self._preview_cfg = self._load_realtime_preview_config()
+        self._sim_preview_cfg = self._load_sim_preview_config()
         self._preview_running = False
         self._preview_thread = None
         self._preview_stop_event = threading.Event()
         self._preview_last_status = "未启动"
+        self._sim_preview_running = False
+        self._sim_preview_thread = None
+        self._sim_preview_stop_event = threading.Event()
         self._real_camera_index = 0
         self._real_mavlink_target_ip = self._load_real_mavlink_target_ip()
         # 检查是否使用GPU
@@ -80,8 +86,8 @@ class BodyCommMavlink(object):
             "task_timeout_s": 180.0,
             "timeout_action": "hover",
             "projection_dt_s": 0.35,
-            "alt_ned_min": -1.8,
-            "alt_ned_max": -0.3,
+            "alt_ned_min": -100.0,
+            "alt_ned_max": 100.0,
             "motion_limits": {
                 "generic": {"xy": 1.5, "z": 0.8, "yawrate_deg": 60.0},
                 "search": {"xy": 1.5, "z": 0.8, "yawrate_deg": 60.0},
@@ -110,7 +116,14 @@ class BodyCommMavlink(object):
             "pos_offset_ned": [0.0, 0.0, 0.0],
             "rpy_offset_rad": [0.0, 0.0, 0.0],
         }
+        self._interrupt_check = None
+        self._init_comm()
 
+    def set_interrupt_check(self, func):
+        """注入中断检查回调，以便上层Agent在急停时打断底层的死循环。"""
+        self._interrupt_check = func
+
+    def _init_comm(self):
         # 运行模式初始化：sim沿用RflySim链路，real_mocap不再写死仿真图像链路
         self.req = None
         self.vis = None
@@ -228,6 +241,40 @@ class BodyCommMavlink(object):
             "detect_hz": _as_float(preview.get("detect_hz", 8.0), 8.0, low=0.5, high=60.0),
             "target_name": str(preview.get("target_name", "")).strip(),
             "show_overlay": _as_bool(preview.get("show_overlay", True), True),
+            "hotkey_save": str(preview.get("hotkey_save", "s")).strip().lower()[:1] or "s",
+            "hotkey_quit": str(preview.get("hotkey_quit", "q")).strip().lower()[:1] or "q",
+        }
+
+    def _load_sim_preview_config(self):
+        """读取仿真实时预览配置。"""
+        cfg = self._runtime_cfg if isinstance(self._runtime_cfg, dict) else {}
+        preview = cfg.get("sim_preview", {}) if isinstance(cfg.get("sim_preview", {}), dict) else {}
+
+        def _as_bool(v, default):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "on")
+            if isinstance(v, (int, float)):
+                return bool(v)
+            return default
+
+        def _as_float(v, default, low=None, high=None):
+            try:
+                val = float(v)
+            except Exception:
+                val = float(default)
+            if low is not None:
+                val = max(low, val)
+            if high is not None:
+                val = min(high, val)
+            return val
+
+        return {
+            "auto_start": _as_bool(preview.get("auto_start", True), True),
+            "window_name": str(preview.get("window_name", "Sim YOLO Preview")).strip() or "Sim YOLO Preview",
+            "detect_hz": _as_float(preview.get("detect_hz", 10.0), 10.0, low=0.5, high=60.0),
+            "target_name": str(preview.get("target_name", "")).strip(),
             "hotkey_save": str(preview.get("hotkey_save", "s")).strip().lower()[:1] or "s",
             "hotkey_quit": str(preview.get("hotkey_quit", "q")).strip().lower()[:1] or "q",
         }
@@ -797,6 +844,68 @@ class BodyCommMavlink(object):
         self._preview_running = True
         return True
 
+    def start_sim_preview(self):
+        """启动仿真实时预览线程（仅显示YOLO检测框）。"""
+        if self._sim_preview_running:
+            self.logger.info("仿真预览已在运行")
+            return True
+        if self.run_mode != "sim":
+            self.logger.info("start_sim_preview跳过: 当前非sim模式")
+            return True
+
+        detect_hz = float(self._sim_preview_cfg.get("detect_hz", 10.0))
+        period = max(1.0 / detect_hz, 0.01)
+        target_name = self._sim_preview_cfg.get("target_name", "")
+        window_name = self._sim_preview_cfg.get("window_name", "Sim YOLO Preview")
+        key_quit = ord(str(self._sim_preview_cfg.get("hotkey_quit", "q"))[0].lower())
+        key_save = ord(str(self._sim_preview_cfg.get("hotkey_save", "s"))[0].lower())
+
+        self._sim_preview_stop_event.clear()
+
+        def _worker():
+            self.logger.info(
+                f"仿真预览线程启动: window={window_name}, detect_hz={detect_hz:.1f}, target={target_name or 'all'}"
+            )
+            while not self._sim_preview_stop_event.is_set():
+                loop_start = time.time()
+                try:
+                    frame = self._get_current_frame()
+                    obj_list, obj_locs, obj_logits, img_with_box, plot_bgr, cost_ms = self._run_yolo_on_frame(frame, target_name)
+                    self.last_detection_image = img_with_box
+                    self.last_detection_time = datetime.now()
+                    self.last_detection_has_object = len(obj_list) > 0
+
+                    cv2.imshow(window_name, plot_bgr)
+
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == key_quit:
+                        self._sim_preview_stop_event.set()
+                        self.logger.info("仿真预览窗口收到退出按键")
+                        break
+                    if key == key_save:
+                        try:
+                            save_path = self.save_detection_image(use_latest=True)
+                            self.logger.info(f"仿真预览热键保存图片: {save_path}")
+                        except Exception as e:
+                            self.logger.warning(f"仿真预览热键保存失败: {e}")
+                except Exception as e:
+                    self.logger.warning(f"仿真预览循环异常(已忽略，不影响飞控): {e}")
+
+                elapsed = time.time() - loop_start
+                if elapsed < period:
+                    time.sleep(period - elapsed)
+
+            try:
+                cv2.destroyWindow(window_name)
+            except Exception:
+                pass
+            self.logger.info("仿真预览线程退出")
+
+        self._sim_preview_thread = threading.Thread(target=_worker, name="sim_preview", daemon=True)
+        self._sim_preview_thread.start()
+        self._sim_preview_running = True
+        return True
+
     def stop_realtime_preview(self):
         """停止实飞实时预览线程。"""
         if not self._preview_running:
@@ -811,8 +920,23 @@ class BodyCommMavlink(object):
         except Exception:
             pass
 
+    def stop_sim_preview(self):
+        """停止仿真实时预览线程。"""
+        if not self._sim_preview_running:
+            return
+        self._sim_preview_stop_event.set()
+        if self._sim_preview_thread is not None:
+            self._sim_preview_thread.join(timeout=1.5)
+        self._sim_preview_thread = None
+        self._sim_preview_running = False
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
     def close_image_source(self):
         """释放图像源资源。"""
+        self.stop_sim_preview()
         self.stop_realtime_preview()
         if self._real_cam is not None:
             try:
@@ -1095,32 +1219,62 @@ class BodyCommMavlink(object):
         return base64.b64encode(img_bytes).decode('utf-8')
 
     def look(self):
-        # 获取前置摄像头的图像，并通过火山引擎LLM进行图像理解
+        # 获取前置摄像头的图像，并用YOLO检测结果返回目标列表
         self.logger.info("调用look_function进行视觉描述")
-        rgb_image = self._get_current_frame()
-        base64_str = self.cv2_to_base64(rgb_image, ".png")
-        response = self.llm_client.chat.completions.create(
-            model="doubao-1-5-vision-pro-32k-250115",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text",
-                         "text": "图片中有哪些目标，请给出名称即可，给出常见的，清晰可见的目标即可，多个目标名称之间用英文逗号分隔"},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{base64_str}"
-                            }
-                        },
-                    ],
-                }
-            ],
-            temperature=0.01
-        )
-        content = response.choices[0].message.content
+        obj_list, _, _, _ = self.detect_yolo("")
+        if not obj_list:
+            content = "未检测到目标"
+        else:
+            unique = []
+            for name in obj_list:
+                if name not in unique:
+                    unique.append(name)
+            content = "看到了: " + ", ".join(unique)
+        self.last_search_result_cn = content
         self.logger.info(f"look_function返回: {str(content)[:120]}")
         return content
+
+    def move_with_speed(self, dx_body, dy_body, dz_body, speed):
+        """
+        带速度控制的相对位置移动（开环速度控制）。
+        使用机体坐标系：前(dx_body)，右(dy_body)，下(dz_body)，单位为米。
+        speed 为设定的线速度，单位为米/秒。
+        该函数会计算所需的运动时间，通过不断发送 SendVelFRD 指令来维持该速度直到到达预期位置。
+        """
+        import math
+        dist = math.sqrt(dx_body**2 + dy_body**2 + dz_body**2)
+        if dist < 0.05 or speed <= 0.05:
+            self.logger.info("move_with_speed: 距离或速度太小，跳过")
+            return True
+
+        # 计算速度在各个方向上的分量
+        vx = (dx_body / dist) * speed
+        vy = (dy_body / dist) * speed
+        vz = (dz_body / dist) * speed
+
+        duration = dist / speed
+        self.logger.info(f"move_with_speed 开始: dist={dist:.2f}m, speed={speed:.2f}m/s, duration={duration:.2f}s")
+        
+        t0 = time.monotonic()
+        while True:
+            # 响应中断
+            if callable(self._interrupt_check) and self._interrupt_check():
+                self.logger.warning("move_with_speed 被上层急停打断")
+                self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                return False
+
+            elapsed = time.monotonic() - t0
+            if elapsed >= duration:
+                break
+
+            self.MavList[0].SendVelFRD(vx, vy, vz, 0)
+            time.sleep(0.05)
+
+        # 运动结束后悬停
+        self.MavList[0].SendVelFRD(0, 0, 0, 0)
+        self.logger.info("move_with_speed 结束")
+        return True
+
 
 
     def approachObjective(self, error_x, error_y):
@@ -1377,7 +1531,7 @@ class BodyCommMavlink(object):
                 s["last_cmd"] = smooth_cmd
             s["next_ok_ts"] = t + s["hold_sec"]
 
-    def face_objective_to_target(self, object_names, max_seconds=15.0, align_tol=25.0, stable_need=3):
+    def face_objective_to_target(self, object_names, max_seconds=45.0, align_tol=25.0, stable_need=3):
         """
         原地转向对准目标，不前进。
         先搜索目标，再根据图像中心偏差调用 faceObjectiveOnly 做原地转向。
@@ -1400,6 +1554,12 @@ class BodyCommMavlink(object):
             last_abs_error_x = None
 
             while True:
+                if callable(self._interrupt_check) and self._interrupt_check():
+                    self.logger.warning(f"face_objective_to_target 被上层急停中断: {object_names}")
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                    self.last_search_result_cn = "转向失败：被急停打断"
+                    return False
+
                 if time.monotonic() - start_ts > max_seconds:
                     self.logger.info(
                         f"face_objective_to_target超时退出: target={object_names} elapsed={time.monotonic() - start_ts:.2f}s"
@@ -1457,7 +1617,7 @@ class BodyCommMavlink(object):
             self.logger.debug(traceback.format_exc())
             return False
 
-    def approach_objective_to_target(self, object_names, max_seconds=20.0, align_tol=80.0, stable_need=3, box_ratio=1.0/5.0):
+    def approach_objective_to_target(self, object_names, max_seconds=60.0, align_tol=80.0, stable_need=3, box_ratio=1.0/5.0):
         """
         靠近目标：先搜索目标，再循环检测并逼近，直到达到停止条件。
         """
@@ -1480,6 +1640,12 @@ class BodyCommMavlink(object):
             stable_cnt = 0
 
             while True:
+                if callable(self._interrupt_check) and self._interrupt_check():
+                    self.logger.warning(f"approach_objective_to_target 被上层急停中断: {canonical_name}")
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                    self.last_search_result_cn = f"靠近失败：被急停打断"
+                    return False
+
                 if time.monotonic() - start_ts > max_seconds:
                     self.logger.warning(
                         f"approach_objective_to_target超时: target={canonical_name} elapsed={time.monotonic() - start_ts:.2f}s"
@@ -1543,7 +1709,7 @@ class BodyCommMavlink(object):
     def strike_objective_to_target(
         self,
         object_names,
-        max_align_seconds=16.0,
+        max_align_seconds=60.0,
         align_tol=18.0,
         align_tol_y=28.0,
         stable_need=4,
@@ -1624,6 +1790,12 @@ class BodyCommMavlink(object):
                 return clamp(base_v * align_penalty, 0.20, ram_speed)
 
             while True:
+                if callable(self._interrupt_check) and self._interrupt_check():
+                    self.logger.warning(f"strike_guide 被上层急停中断: {canonical_name}")
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                    self.last_search_result_cn = f"打击失败：被急停打断"
+                    return False
+
                 elapsed = time.monotonic() - guide_start_ts
                 if elapsed > max_align_seconds:
                     self.logger.warning(
@@ -1727,6 +1899,12 @@ class BodyCommMavlink(object):
 
             t0 = time.monotonic()
             while True:
+                if callable(self._interrupt_check) and self._interrupt_check():
+                    self.logger.warning(f"strike_terminal 被上层急停中断: {canonical_name}")
+                    self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                    self.last_search_result_cn = f"打击失败：冲刺被急停打断"
+                    return False
+
                 elapsed = time.monotonic() - t0
                 if elapsed >= terminal_seconds:
                     break
