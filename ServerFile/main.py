@@ -88,6 +88,9 @@ if __name__ == '__main__':
         if hasattr(Comm_api, 'set_interrupt_check'):
             Comm_api.set_interrupt_check(lambda: getattr(chat_api, "is_interrupted", False))
 
+        # 围栏连续触发超限时自动中断当前任务（与 test_exp2 保持一致）
+        Comm_api._interrupt_set_callback = lambda: setattr(chat_api, "is_interrupted", True)
+
         logger.info("进入主控制循环")
         chat_api.Main_Control()
     finally:

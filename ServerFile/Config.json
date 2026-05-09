@@ -22,7 +22,7 @@
     },
     "real_camera": {
         "source": "opencv", // real_mocap下图像来源: opencv
-        "device_index": 0, // 本地相机索引
+        "device_index": "udp:\/\/@0.0.0.0:5000",
         "width": 640,
         "height": 480,
         "fps": 30,

@@ -48,6 +48,7 @@ class Description(object):
                 "20、提供方法self.save_detection_image()：实时触发一次目标检测并保存当前检测结果图；若当前未检测到目标，也要保存当前摄像头图"
                 "21、提供方法self.save_latest_detection_image()：保存最近一次检测缓存图；若缓存为空则自动触发一次检测后保存"
                 "22、如果你需要控制无人机的飞行速度（例如用户说速度慢一点、或者指定了m/s），请调用 self.MavList[0].move_with_speed(dx_body, dy_body, dz_body, speed) 函数。dx/dy/dz为机体坐标系下的位移（米），speed为线速度（米/秒）。"
+                "23、【安全强制规则】无论任何任务，在每段靠近(approach)、搜索(search)、循环检测结束后，都必须立即调用 self.MavList[0].SendVelFRD(0, 0, 0, 0) 使无人机完全停止悬停，禁止在循环结束后仍有残余速度；若指令要求'减速悬停'或'停下来'，必须确保最后一行为 SendVelFRD(0,0,0,0)。"
                 "现在需要你来编写一段python代码，只生成可执行python代码，需要实现的功能为："
             )
         }

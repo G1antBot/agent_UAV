@@ -252,7 +252,7 @@ class OpenAI_APIs(Des):
                     approach_parsed["distance_m"],
                 )
             else:
-                ok = self._execute_approach_template(approach_parsed["object_name"])
+                ok = self._execute_approach_template(approach_parsed["object_name"], spatial_hint=text)
             if ok:
                 return "continue", self._get_latest_result_cn(default_text="靠近完成")
             return "continue", self._get_latest_result_cn(default_text="靠近失败")
@@ -306,21 +306,49 @@ class OpenAI_APIs(Des):
 
     @staticmethod
     def _normalize_object_alias(name):
-        """归一化常见目标别名，减少LLM在英文/中文目标名上的漂移。"""
+        """归一化常见目标别名，减少LLM在英文/中文目标名上的漂移。
+        两级匹配：
+        1. 精确匹配：直接查表
+        2. 模糊包含匹配：当LLM传入"最近的红色气球"等带修饰词的目标名时，
+           提取核心类别关键词并映射到YOLOE能识别的标准名
+        """
         if not isinstance(name, str):
             return name
         text = name.strip()
+
+        # === 第一级：精确匹配（覆盖常见写法和LLM常见漂移） ===
         alias_map = {
-            "drone": "uav",
-            "无人机": "uav",
-            "uav": "uav",
-            "balloon": "balloon",
-            "气球": "balloon",
-            "red balloon": "red balloon",
-            "blue ball": "blue ball",
-            "小球": "blue ball",
+            "drone": "uav", "无人机": "uav", "uav": "uav",
+            "balloon": "balloon", "气球": "balloon",
+            "red balloon": "red balloon", "red_balloon": "red balloon",
+            "blue ball": "blue ball", "blue_ball": "blue ball",
+            "小球": "blue ball", "蓝色小球": "blue ball",
+            "红色气球": "red balloon", "红气球": "red balloon",
+            "car": "car", "小车": "car", "汽车": "car", "车辆": "car",
         }
-        return alias_map.get(text.lower(), alias_map.get(text, text))
+        exact = alias_map.get(text.lower(), alias_map.get(text, None))
+        if exact is not None:
+            return exact
+
+        # === 第二级：模糊包含匹配 ===
+        # 按从长到短排序，避免"气球"先于"红色气球"匹配
+        fuzzy_rules = [
+            # (关键词列表, 映射目标)  —— 中英文混合，长词优先
+            (["红色气球", "红气球", "red balloon", "red_balloon"], "red balloon"),
+            (["蓝色小球", "蓝色球", "蓝球", "blue ball", "blue_ball"], "blue ball"),
+            (["气球", "balloon"],  "balloon"),
+            (["小球", "ball"],     "blue ball"),
+            (["小车", "车辆", "汽车", "car"], "car"),
+            (["无人机", "飞机", "uav", "drone"], "uav"),
+        ]
+        lower = text.lower()
+        for keywords, target in fuzzy_rules:
+            for kw in keywords:
+                if kw in text or kw in lower:
+                    return target
+
+        # 都没匹配到，原样返回
+        return text
 
     def _split_task_clauses(self, task: str):
         """
@@ -331,6 +359,52 @@ class OpenAI_APIs(Des):
         # 先按连接词切，再按常见标点切
         clauses = re.split(r"(?:然后|再|并且|并|,|，|;|；|。)", task)
         return [c.strip() for c in clauses if c and c.strip()]
+
+    def _is_complex_instruction(self, task: str) -> bool:
+        """检测指令是否包含语义耦合信号，决定是否跳过子句拆分。
+        命中任一信号即返回 True，整条指令将不被拆分而直接交给 LLM。
+        """
+        text = (task or "").strip()
+        if not text:
+            return False
+
+        # 1. 条件/分支信号
+        if re.search(r"如果|若是|若(?!干)|有的话|没有就|否则|根据|找到.*的话|找不到.*的话", text):
+            return True
+
+        # 2. 约束耦合信号（动作 + 约束在同一指令中）
+        if re.search(r"同时|过程中|前提下|情况下|期间", text):
+            return True
+
+        # 3. 自适应/动态调整信号
+        if re.search(r"自适应|自动调|远.*快.*近.*慢", text):
+            return True
+
+        # 4. 循环终止条件
+        if re.search(r"直到|一边.*一边|一旦", text):
+            return True
+
+        # 5. 动态速度修饰（动作 + 速度变化描述不可拆分）
+        if re.search(r"(?:减速|降速|加速|递减|递增|逐步|逐渐).*(?:靠近|接近|飞向|前进|后退|左转|右转)", text):
+            return True
+        if re.search(r"(?:靠近|接近|飞向|前进|后退|左转|右转).*(?:减速|降速|加速|递减|递增|逐步|逐渐|速度)", text):
+            return True
+
+        # 6. 连续搜索+靠近的复合语义
+        if re.search(r"(?:搜索|找到|找).*(?:靠近|接近|飞向).*(?:靠近|接近|飞向|减速|加速|悬停)", text):
+            return True
+
+        # 7. 时序复合动作（先做A再做B，方向可能相反）
+        if re.search(r"(?:前进|飞行|移动)\d+.*?(?:后|再|然后).*?(?:返回|原路|回来)", text):
+            return True
+
+        # 8. 渐变语义修饰（一点点/慢慢等修饰靠近/远离动作）
+        if re.search(r"(?:一点点|慢慢|缓慢|小心).*?(?:靠近|接近|飞向|远离)", text):
+            return True
+        if re.search(r"(?:靠近|接近|飞向|远离).*?(?:一点点|慢慢|缓慢|小心)", text):
+            return True
+
+        return False
 
     def _parse_body_move_clause(self, clause: str):
         """
@@ -484,17 +558,29 @@ class OpenAI_APIs(Des):
             return None
 
         text = re.sub(r"\s+", "", clause)
+
+        # ── 前置守卫：靠近/接近后面紧跟动作修饰（速度/时序词），说明是复合语义，交 LLM ──
+        if re.search(r"(?:靠近|接近|飞向).*?(?:时|前|后|中|过程).*?(?:减速|降速|加速|慢慢|逐步|逐渐)", text):
+            self.logger.info(f"硬规则路由放行: 发现复杂语义修饰 '{text}'")
+            return None
+
         modifier_key, distance_m = self._match_distance_modifier(text)
 
         object_name = ""
-        pre_match = re.search(r"往(.+?)(?:方向)?(?:靠近|接近|飞向)", text)
+        pre_match = re.search(r"(?:往|朝)(.+?)(?:方向)?(?:靠近|接近|飞向)", text)
         if pre_match:
             object_name = (pre_match.group(1) or "").strip()
         else:
             m = re.search(r"(?:靠近|接近|飞向)(.+?)$", text)
-            if not m:
-                return None
-            object_name = (m.group(1) or "").strip()
+            if m:
+                object_name = (m.group(1) or "").strip()
+            else:
+                # "去小车那里" / "到红色气球那边" 等口语化靠近表述
+                m2 = re.search(r"(?:去|到)(.+?)(?:那里|那边|那儿|那去)$", text)
+                if m2:
+                    object_name = (m2.group(1) or "").strip()
+                else:
+                    return None
 
         if modifier_key:
             object_name = object_name.replace(modifier_key, "").strip()
@@ -504,8 +590,28 @@ class OpenAI_APIs(Des):
         object_name = re.sub(r"方向$", "", object_name).strip()
         object_name = re.sub(r"^(?:一下|下|一个|目标|物体)", "", object_name).strip()
         object_name = re.sub(r"(?:目标|物体|并停下|再停下|后停下)$", "", object_name).strip()
+        # 清除尾部距离修饰（如"到1米"、"到2m"）——这是靠近参数而非目标名
+        object_name = re.sub(r"到\d+(?:\.\d+)?(?:米|m|厘米|cm)$", "", object_name).strip()
         if not object_name:
             return None
+
+        # ── 后置守卫：拒绝非实体目标名（代词/动作碎片/修饰碎片） ──
+        if re.match(r"^(?:它|它们|这个|那个|这里|那里)", object_name):
+            self.logger.info(f"靠近硬规则放行: 目标以代词开头 '{object_name}'，交由LLM")
+            return None
+        # 如果提取出的"目标"包含动作动词/时序词，说明是误提取的碎片
+        if re.search(r"减速|降速|加速|悬停|远离|搜索|巡逻|降落|起飞|返回|或", object_name):
+            self.logger.info(f"靠近硬规则放行: 目标含动作碎片 '{object_name}'，交由LLM")
+            return None
+        # 如果目标名包含逗号/句号等标点，说明是截断碎片
+        if re.search(r"[，,。；;]", object_name):
+            self.logger.info(f"靠近硬规则放行: 目标含标点碎片 '{object_name}'，交由LLM")
+            return None
+        # 如果目标名过长（超过10字符），极可能是误提取的指令片段
+        if len(object_name) > 10:
+            self.logger.info(f"靠近硬规则放行: 目标名过长 '{object_name}'，交由LLM")
+            return None
+
         parsed = {"type": "approach", "object_name": object_name}
         if distance_m is not None:
             parsed["distance_m"] = float(distance_m)
@@ -574,7 +680,16 @@ class OpenAI_APIs(Des):
         if not m:
             return None
 
-        object_name = (m.group(1) or "").strip()
+        raw_tail = (m.group(1) or "").strip()
+
+        # 如果"找到XX"后面还跟着动作动词（靠近/接近/飞向等），
+        # 说明这是复合指令（如"找到红色气球靠近它"），不应被搜索硬规则独占，
+        # 交给LLM整体处理
+        if re.search(r"靠近|接近|飞向", raw_tail):
+            self.logger.info(f"搜索硬规则放行: 检测到后续动作动词 '{raw_tail}'")
+            return None
+
+        object_name = raw_tail
         object_name = re.sub(r"^(?:一下|下|一个|目标|物体)", "", object_name).strip()
         object_name = re.sub(r"^到", "", object_name).strip()
         object_name = re.sub(r"(?:目标|物体|在哪里|在哪)$", "", object_name).strip()
@@ -595,6 +710,8 @@ class OpenAI_APIs(Des):
             return False
 
         try:
+            # 归一化目标名（如"最近的红色气球" → "red balloon"）
+            object_name = self._normalize_object_alias(object_name)
             # 兼容旧签名（仅object_name）与新签名（object_name, mode）
             try:
                 found = self.search_object_function(object_name, mode=mode)
@@ -611,7 +728,7 @@ class OpenAI_APIs(Des):
             self.logger.debug(traceback.format_exc())
             return False
 
-    def _execute_approach_template(self, object_name: str):
+    def _execute_approach_template(self, object_name: str, spatial_hint: str = ""):
         """
         执行靠近模板：搜索并持续逼近目标，直到满足停止条件。
         """
@@ -621,13 +738,15 @@ class OpenAI_APIs(Des):
             return False
 
         try:
+            # 归一化目标名（如"最近的红色气球" → "red balloon"）
+            object_name = self._normalize_object_alias(object_name)
             # 硬规则直接调用底层提供的全自动寻找+靠近高级函数，而不用暴露给LLM的基础控制函数
             comm_obj = getattr(self.search_object_function, "__self__", None)
             if not comm_obj or not hasattr(comm_obj, "approach_objective_to_target"):
                 print("执行失败：底层未提供高级approach_objective_to_target功能")
                 return False
 
-            ok = comm_obj.approach_objective_to_target(object_name)
+            ok = comm_obj.approach_objective_to_target(object_name, spatial_hint=spatial_hint)
             summary = self._get_latest_result_cn(default_text="靠近完成")
             print(summary)
             self.logger.info(f"template_approach target={object_name} ok={bool(ok)} summary={summary}")
@@ -654,6 +773,8 @@ class OpenAI_APIs(Des):
                 self.logger.warning("靠近一点点拒绝执行: 缺少face_objective_to_target")
                 return False
 
+            # 归一化目标名
+            object_name = self._normalize_object_alias(object_name)
             ok = comm_obj.face_objective_to_target(object_name)
             if not ok:
                 self.logger.warning(f"靠近一点点失败: 未能对准 {object_name}")
@@ -743,7 +864,7 @@ class OpenAI_APIs(Des):
             if distance_m is not None:
                 ok = self._execute_approach_distance_template(object_name, distance_m)
             else:
-                ok = self._execute_approach_template(object_name)
+                ok = self._execute_approach_template(object_name, spatial_hint=text)
             summary = self._get_latest_result_cn(default_text="靠近完成") if ok else "靠近失败"
             return True, bool(ok), summary
 
@@ -847,7 +968,24 @@ class OpenAI_APIs(Des):
     def _wait_until_position_reached(self, tx: float, ty: float, tz: float, timeout_s: float = 12.0, pos_tol: float = 0.18):
         """
         等待无人机位置到达目标点，避免后续子句提前执行。
+        如果目标高度触发了安全保护，自动调整目标高度以避免等待超时。
         """
+        try:
+            comm_obj = getattr(self.search_object_function, "__self__", None)
+            if comm_obj is not None and hasattr(comm_obj, "get_safety_summary"):
+                safety = comm_obj.get_safety_summary()
+                if safety.get("enable_alt_guard", True):
+                    floor = safety.get("alt_floor_ned", -0.3)
+                    ceiling = safety.get("alt_ceiling_ned", -5.0)
+                    safe_alt = safety.get("alt_safe_ned", -0.5)
+                    if tz > floor:
+                        self.logger.info(f"wait_pos: 目标高度 tz={tz:.2f} 触发下限保护 {floor:.2f}，期望调整为修正高度 {safe_alt:.2f}")
+                        tz = safe_alt
+                    elif tz < ceiling:
+                        self.logger.info(f"wait_pos: 目标高度 tz={tz:.2f} 触发上限保护 {ceiling:.2f}，期望调整为限制高度 {ceiling:.2f}")
+                        tz = ceiling
+        except Exception as e:
+            self.logger.debug(f"检查安全保护配置失败: {e}")
         start = time.monotonic()
         while time.monotonic() - start <= timeout_s:
             x, y, z = self.MavList[0].uavPosNED[0], self.MavList[0].uavPosNED[1], self.MavList[0].uavPosNED[2]
@@ -905,6 +1043,8 @@ class OpenAI_APIs(Des):
             print("执行失败：未注入face_objective功能")
             self.logger.warning("原地朝向目标拒绝执行: 未注入face_objective_function")
             return False
+        # 归一化目标名
+        object_name = self._normalize_object_alias(object_name)
         ok = self.face_objective_function(object_name)
         if not ok:
             self.logger.warning(f"原地朝向目标失败: {object_name}")
@@ -913,8 +1053,8 @@ class OpenAI_APIs(Des):
 
     def _execute_return_home_template(self):
         """
-        飞回起飞点（_home_pos_ned），保持当前高度飞回后再调整高度。
-        不执行降落，仅悬停在起飞点上方。
+        飞回起飞点（_home_pos_ned），分两段飞行避免冲过头，
+        最后校正朝向到起飞时的方向。不执行降落，仅悬停在起飞点上方。
         """
         try:
             comm_obj = getattr(self.search_object_function, "__self__", None)
@@ -928,33 +1068,81 @@ class OpenAI_APIs(Des):
 
             mav = self.MavList[0]
             tx, ty, tz = float(home[0]), float(home[1]), float(home[2])
+            cur_x = float(mav.uavPosNED[0])
+            cur_y = float(mav.uavPosNED[1])
             cur_z = float(mav.uavPosNED[2])
             yaw = float(mav.uavAngEular[2])
+            home_yaw = getattr(comm_obj, "_home_yaw", yaw) if comm_obj else yaw
 
-            # 先保持当前高度飞到起飞点正上方
-            self.logger.info(
-                f"return_home phase1: fly to ({tx:.2f},{ty:.2f},{cur_z:.2f})"
-            )
-            mav.SendPosNED(tx, ty, cur_z, yaw)
-            reached_xy = self._wait_until_position_reached(
-                tx, ty, cur_z, timeout_s=15.0, pos_tol=0.25
-            )
+            # 预处理：如果贴地（高度 > -0.3m），先爬升到安全高度再水平移动
+            safe_cruise_alt = -0.5
+            if cur_z > -0.3:
+                self.logger.info(
+                    f"return_home pre-climb: 贴地修正 alt={cur_z:.2f} -> {safe_cruise_alt:.2f}"
+                )
+                mav.SendPosNED(cur_x, cur_y, safe_cruise_alt, yaw)
+                self._wait_until_position_reached(
+                    cur_x, cur_y, safe_cruise_alt, timeout_s=5.0, pos_tol=0.25
+                )
+                cur_z = safe_cruise_alt
+
+            # 计算与起飞点的水平距离
+            dx = tx - cur_x
+            dy = ty - cur_y
+            dist = (dx * dx + dy * dy) ** 0.5
+
+            if dist > 1.0:
+                # Phase1a: 先飞到中点，减速停稳
+                mid_x = cur_x + dx * 0.5
+                mid_y = cur_y + dy * 0.5
+                self.logger.info(
+                    f"return_home phase1a: fly to midpoint ({mid_x:.2f},{mid_y:.2f},{cur_z:.2f})"
+                )
+                mav.SendPosNED(mid_x, mid_y, cur_z, yaw)
+                self._wait_until_position_reached(
+                    mid_x, mid_y, cur_z, timeout_s=15.0, pos_tol=0.25
+                )
+                mav.SendVelFRD(0, 0, 0, 0)
+                time.sleep(0.3)
+
+                # Phase1b: 从中点飞到起飞点正上方
+                self.logger.info(
+                    f"return_home phase1b: fly to home ({tx:.2f},{ty:.2f},{cur_z:.2f})"
+                )
+                mav.SendPosNED(tx, ty, cur_z, yaw)
+                reached_xy = self._wait_until_position_reached(
+                    tx, ty, cur_z, timeout_s=15.0, pos_tol=0.25
+                )
+            else:
+                self.logger.info(
+                    f"return_home phase1: fly to ({tx:.2f},{ty:.2f},{cur_z:.2f})"
+                )
+                mav.SendPosNED(tx, ty, cur_z, yaw)
+                reached_xy = self._wait_until_position_reached(
+                    tx, ty, cur_z, timeout_s=15.0, pos_tol=0.25
+                )
+
             if not reached_xy:
                 print("执行失败：返回起飞点水平位移超时")
                 self.logger.warning("返回起飞点失败: 水平位移超时")
                 return False
 
-            # 再调整到起飞高度
+            # Phase2: 调整到起飞高度
             if abs(cur_z - tz) > 0.15:
                 self.logger.info(
                     f"return_home phase2: adjust alt to {tz:.2f}"
                 )
-                mav.SendPosNED(tx, ty, tz, yaw)
+                mav.SendPosNED(tx, ty, tz, home_yaw)
                 reached_z = self._wait_until_position_reached(
                     tx, ty, tz, timeout_s=8.0, pos_tol=0.25
                 )
                 if not reached_z:
                     self.logger.warning("返回起飞点: 高度调整超时，已到达水平位置")
+
+            # Phase3: 校正朝向到起飞时的方向
+            self.logger.info(f"return_home phase3: correct yaw {yaw:.3f} -> {home_yaw:.3f}")
+            mav.SendPosNED(tx, ty, tz, home_yaw)
+            time.sleep(1.0)
 
             print("已返回起飞点")
             self.logger.info("return_home 完成")
@@ -1045,6 +1233,7 @@ class OpenAI_APIs(Des):
         exec_globals = {
             "self": self,
             "time": time,
+            "math": math,
             "b2n": b2n,
             "display": lambda *args, **kwargs: None,
             "final_answer": lambda x: print(f"执行成功：{x}"),
@@ -1336,6 +1525,11 @@ class OpenAI_APIs(Des):
             self.logger.debug(traceback.format_exc())
             return False
         finally:
+            # ── 无论成功/异常，都强制零速悬停，防止 LLM 代码残余速度 ──
+            try:
+                self.MavList[0].SendVelFRD(0, 0, 0, 0)
+            except Exception:
+                pass
             self.search_object_function = orig_search
             self.approachObjective_function = orig_approach
             self.detect_function = orig_detect
@@ -1530,9 +1724,15 @@ class OpenAI_APIs(Des):
                         )
                     continue
 
-                clauses = self._split_task_clauses(task)
-                if not clauses:
+                if self._is_complex_instruction(task):
+                    self.logger.info(f"复杂指令检测: 跳过子句拆分, 整条交给LLM task={task}")
                     clauses = [task]
+                    _skip_hard_rules = True
+                else:
+                    clauses = self._split_task_clauses(task)
+                    if not clauses:
+                        clauses = [task]
+                    _skip_hard_rules = False
                 overall_ok = True
                 last_summary = ""
 
@@ -1547,16 +1747,18 @@ class OpenAI_APIs(Des):
                     self.logger.info(f"CLAUSE_START cmd_id={cmd_id} idx={idx}/{len(clauses)} clause={clause}")
                     self._reset_comm_task_timeout(clause)
 
-                    action, summary = self._handle_hard_rules(clause)
-                    if action == "continue":
-                        step_ok = not any(k in (summary or "") for k in ("失败", "拒绝", "冲突", "超时", "异常"))
-                        last_summary = summary
-                        self._emit_step_result(cmd_id, idx, len(clauses), "硬规则", step_ok, summary)
-                        if not step_ok:
-                            overall_ok = False
-                            self.logger.warning(f"CLAUSE_ABORT cmd_id={cmd_id} idx={idx} reason={summary}")
-                            break
-                        continue
+                    # 复杂指令跳过硬规则，直接交给LLM
+                    if not _skip_hard_rules:
+                        action, summary = self._handle_hard_rules(clause)
+                        if action == "continue":
+                            step_ok = not any(k in (summary or "") for k in ("失败", "拒绝", "冲突", "超时", "异常"))
+                            last_summary = summary
+                            self._emit_step_result(cmd_id, idx, len(clauses), "硬规则", step_ok, summary)
+                            if not step_ok:
+                                overall_ok = False
+                                self.logger.warning(f"CLAUSE_ABORT cmd_id={cmd_id} idx={idx} reason={summary}")
+                                break
+                            continue
 
                     ok = self._run_agent_for_clause(agent, clause)
                     if ok:

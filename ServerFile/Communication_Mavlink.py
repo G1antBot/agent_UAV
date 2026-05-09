@@ -81,13 +81,15 @@ class BodyCommMavlink(object):
         self._safety_cfg = {
             "enabled": True,
             "single_vehicle_only": True,
-            "enable_space_fence": False,
-            "max_radius_m": 3.0,
+            "enable_space_fence": True,
+            "enable_alt_guard": True,           # 高度保护独立开关，默认始终开启
+            "max_radius_m": 8.0,
             "task_timeout_s": 180.0,
             "timeout_action": "hover",
             "projection_dt_s": 0.35,
-            "alt_ned_min": -100.0,
-            "alt_ned_max": 100.0,
+            "alt_ceiling_ned": -10.0,            # 最高飞行高度（NED，-10m = 离地10m）
+            "alt_floor_ned": -0.05,              # 最低飞行高度（NED，-0.05m = 离地0.05m）
+            "alt_safe_ned": -0.3,               # 贴地时自动修正的安全高度
             "motion_limits": {
                 "generic": {"xy": 1.5, "z": 0.8, "yawrate_deg": 60.0},
                 "search": {"xy": 1.5, "z": 0.8, "yawrate_deg": 60.0},
@@ -177,10 +179,11 @@ class BodyCommMavlink(object):
             float(self.MavList[0].uavPosNED[1]),
             float(self.MavList[0].uavPosNED[2]),
         ])
+        self._home_yaw = float(self.MavList[0].uavAngEular[2])
         self._install_motion_safety_guards()
         self.logger.info(
             f"安全约束已启用: radius={self._safety_cfg['max_radius_m']}m, timeout={self._safety_cfg['task_timeout_s']}s, "
-            f"alt_ned=[{self._safety_cfg['alt_ned_min']},{self._safety_cfg['alt_ned_max']}], "
+            f"alt_guard={self._safety_cfg['enable_alt_guard']}, floor={self._safety_cfg['alt_floor_ned']}m, ceiling={self._safety_cfg['alt_ceiling_ned']}m, "
             f"space_fence={self._safety_cfg['enable_space_fence']}, single_vehicle_only={self._safety_cfg['single_vehicle_only']}"
         )
 
@@ -307,9 +310,14 @@ class BodyCommMavlink(object):
         height = int(cam_cfg.get("height", 480))
         fps = int(cam_cfg.get("fps", 30))
 
-        cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(cam_index)
+        if isinstance(cam_index, str) and cam_index.lower().startswith(('udp://', 'rtsp://', 'http://', 'tcp://')):
+            # 如果是网络流地址，直接通过 FFMPEG 读取
+            cap = cv2.VideoCapture(cam_index, cv2.CAP_FFMPEG)
+        else:
+            # 如果是本地数字索引或本地路径设备
+            cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(cam_index)
         if not cap.isOpened():
             self.logger.warning(f"真实相机打开失败: index={cam_index}")
             self._real_cam = None
@@ -397,22 +405,53 @@ class BodyCommMavlink(object):
             cur_x, cur_y, cur_z = float(mav.uavPosNED[0]), float(mav.uavPosNED[1]), float(mav.uavPosNED[2])
             return np.array([cur_x + dx_ned, cur_y + dy_ned, cur_z + dz_ned], dtype=float)
 
+        def _correct_altitude(target_z):
+            """贴地后自动修正到安全高度"""
+            cur_x = float(mav.uavPosNED[0])
+            cur_y = float(mav.uavPosNED[1])
+            cur_yaw = float(mav.uavAngEular[2])
+            original_send_vel_frd(0, 0, 0, 0)  # 先停止
+            original_send_pos_ned(cur_x, cur_y, target_z, cur_yaw)  # 修正高度
+            self.logger.info(f"[SAFETY] 高度自动修正至 {target_z:.2f}m")
+
         def _check_fence(projected_pos, label):
-            if not bool(self._safety_cfg.get("enable_space_fence", True)):
-                return True
             home = getattr(self, "_home_pos_ned", None)
-            if home is None:
-                return True
-            radius = float(np.linalg.norm(projected_pos[:2] - home[:2]))
-            alt_ned = float(projected_pos[2])
-            if radius > float(self._safety_cfg.get("max_radius_m", 3.0)):
-                _warn("空间围栏触发", f"{label} radius={radius:.2f}m > {self._safety_cfg['max_radius_m']:.2f}m")
-                _send_hover()
-                return False
-            if alt_ned < float(self._safety_cfg.get("alt_ned_min", -1.8)) or alt_ned > float(self._safety_cfg.get("alt_ned_max", -0.3)):
-                _warn("高度围栏触发", f"{label} alt_ned={alt_ned:.2f} outside [{self._safety_cfg['alt_ned_min']:.2f},{self._safety_cfg['alt_ned_max']:.2f}]")
-                _send_hover()
-                return False
+
+            # 水平围栏（受 enable_space_fence 控制）
+            if bool(self._safety_cfg.get("enable_space_fence", False)):
+                if home is not None:
+                    radius = float(np.linalg.norm(projected_pos[:2] - home[:2]))
+                    if radius > float(self._safety_cfg.get("max_radius_m", 3.0)):
+                        _warn("空间围栏触发", f"{label} radius={radius:.2f}m > {self._safety_cfg['max_radius_m']:.2f}m")
+                        _send_hover()
+                        # 连续围栏计数 → 超限则设中断标志
+                        self._fence_consec_count = getattr(self, "_fence_consec_count", 0) + 1
+                        fence_limit = int(self._safety_cfg.get("fence_consec_limit", 15))
+                        if self._fence_consec_count >= fence_limit:
+                            _warn("围栏连续触发超限",
+                                  f"count={self._fence_consec_count} >= {fence_limit}, 设置中断标志")
+                            cb = getattr(self, "_interrupt_set_callback", None)
+                            if callable(cb):
+                                cb()
+                        return False
+
+            # 高度保护（独立开关，默认始终启用）
+            if bool(self._safety_cfg.get("enable_alt_guard", True)):
+                alt_ned = float(projected_pos[2])
+                floor = float(self._safety_cfg.get("alt_floor_ned", -0.3))
+                ceiling = float(self._safety_cfg.get("alt_ceiling_ned", -5.0))
+                safe_alt = float(self._safety_cfg.get("alt_safe_ned", -0.5))
+                if alt_ned > floor:  # 太低/贴地（NED中z越大越低）
+                    _warn("高度保护触发", f"{label} 贴地修正 alt={alt_ned:.2f} > floor={floor:.2f}")
+                    _correct_altitude(safe_alt)
+                    return False
+                if alt_ned < ceiling:  # 太高
+                    _warn("高度保护触发", f"{label} 超高 alt={alt_ned:.2f} < ceiling={ceiling:.2f}")
+                    _send_hover()
+                    return False
+
+            # 围栏通过 → 重置连续计数
+            self._fence_consec_count = 0
             return True
 
         def guarded_send_vel_frd(vx=0, vy=0, vz=0, yawrate=0):
@@ -477,10 +516,9 @@ class BodyCommMavlink(object):
         def guarded_send_land(xM, yM, zM):
             if not bool(self._safety_cfg.get("enabled", True)):
                 return original_send_land(xM, yM, zM)
-            if _timeout_active():
-                _warn("任务超时", "land被降级为悬停")
-                return _send_hover()
-            return original_send_land(xM, yM, zM)
+            # 安全模式下禁止降落指令，防止LLM生成代码意外降落
+            _warn("降落指令被拦截", f"mode={_current_mode()} -> 降级为悬停 (LLM不可降落)")
+            return _send_hover()
 
         mav.SendVelFRD = guarded_send_vel_frd
         mav.SendPosNED = guarded_send_pos_ned
@@ -497,10 +535,13 @@ class BodyCommMavlink(object):
         limits = self._safety_cfg.get("motion_limits", {})
         return {
             "enabled": bool(self._safety_cfg.get("enabled", True)),
-            "enable_space_fence": bool(self._safety_cfg.get("enable_space_fence", True)),
+            "enable_space_fence": bool(self._safety_cfg.get("enable_space_fence", False)),
+            "enable_alt_guard": bool(self._safety_cfg.get("enable_alt_guard", True)),
             "radius_m": float(self._safety_cfg.get("max_radius_m", 3.0)),
             "timeout_s": float(self._safety_cfg.get("task_timeout_s", 60.0)),
-            "alt_ned": [float(self._safety_cfg.get("alt_ned_min", -1.8)), float(self._safety_cfg.get("alt_ned_max", -0.3))],
+            "alt_ceiling_ned": float(self._safety_cfg.get("alt_ceiling_ned", -5.0)),
+            "alt_floor_ned": float(self._safety_cfg.get("alt_floor_ned", -0.3)),
+            "alt_safe_ned": float(self._safety_cfg.get("alt_safe_ned", -0.5)),
             "limits": limits,
             "single_vehicle_only": bool(self._safety_cfg.get("single_vehicle_only", True)),
         }
@@ -963,6 +1004,9 @@ class BodyCommMavlink(object):
             "红色气球": "red balloon",
             "红气球": "red balloon",
             "红色球": "red balloon",
+            "红色物体": "red balloon",
+            "红色目标": "red balloon",
+            "气球": "red balloon",
             "无人机": "uav",
             "无人飞机": "uav",
             "无人机目标": "uav",
@@ -973,10 +1017,17 @@ class BodyCommMavlink(object):
             "飞机": "airplane",
             "airplane": "airplane",
             "小车":"car",
-            "小车":"car",
             "车":"car",
             "无人车":"car",
         }
+
+        # LLM有时生成中文泛称如"目标"、"物体"等，这些无法匹配YOLO类别
+        # 返回空串让上层进行全目标检测
+        generic_terms = {"目标", "物体", "东西", "对象", "target", "object"}
+        if name in generic_terms:
+            self.logger.warning(f"_canonical_object_name: 泛称 '{name}' 无法匹配具体类别，返回空串")
+            return ""
+
         return alias_map.get(name, name)
 
     @staticmethod
@@ -1263,6 +1314,44 @@ class BodyCommMavlink(object):
                 self.MavList[0].SendVelFRD(0, 0, 0, 0)
                 return False
 
+            # 实时高度保护
+            cur_z = float(self.MavList[0].uavPosNED[2])
+            floor = float(self._safety_cfg.get("alt_floor_ned", -0.3))
+            if bool(self._safety_cfg.get("enable_alt_guard", True)) and cur_z > floor:
+                self.logger.warning(f"move_with_speed: 高度保护触发 z={cur_z:.2f} > floor={floor:.2f}")
+                self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                safe_z = float(self._safety_cfg.get("alt_safe_ned", -0.5))
+                self.MavList[0].SendPosNED(
+                    float(self.MavList[0].uavPosNED[0]),
+                    float(self.MavList[0].uavPosNED[1]),
+                    safe_z, float(self.MavList[0].uavAngEular[2])
+                )
+                time.sleep(1.0)
+                # 抛出异常以打断生成代码的循环，中止当前任务
+                raise RuntimeError(f"高度保护触发 (z={cur_z:.2f}m)，连续控制任务已被安全拦截中止")
+
+            # 实时空间围栏保护
+            if bool(self._safety_cfg.get("enable_space_fence", False)):
+                home = getattr(self, "_home_pos_ned", None)
+                if home is not None:
+                    cur_pos = np.array([
+                        float(self.MavList[0].uavPosNED[0]),
+                        float(self.MavList[0].uavPosNED[1])
+                    ])
+                    radius = float(np.linalg.norm(cur_pos - home[:2]))
+                    max_r = float(self._safety_cfg.get("max_radius_m", 8.0))
+                    if radius > max_r:
+                        self.logger.warning(f"move_with_speed: 空间围栏触发 radius={radius:.2f}m > {max_r:.2f}m，中止并返航")
+                        self.MavList[0].SendVelFRD(0, 0, 0, 0)
+                        time.sleep(0.3)
+                        # 发送返航位置指令
+                        self.MavList[0].SendPosNED(
+                            float(home[0]), float(home[1]),
+                            float(self.MavList[0].uavPosNED[2]),
+                            float(self.MavList[0].uavAngEular[2])
+                        )
+                        raise RuntimeError(f"空间围栏触发 (radius={radius:.2f}m > {max_r:.2f}m)，返航中止")
+
             elapsed = time.monotonic() - t0
             if elapsed >= duration:
                 break
@@ -1434,7 +1523,16 @@ class BodyCommMavlink(object):
                     yawrate = clamp(s["K_yaw"] * ex, -s["yaw_max"], s["yaw_max"])
 
                     # 将 ey 映射为俯仰方向角 alpha（X–Z 平面方向）
-                    alpha = math.atan(ey / s["ay"]) if s["ay"] != 0 else 0.0
+                    # 当 |ey| 很大时（目标远离画面中心），动态降低 ay 使 alpha 更陡，
+                    # 这样 vz 分量增大、vx 自动减小，优先爬升/下降以保持目标在视野内
+                    ey_ratio = abs(ey) / s["ay"]  # ey 占画面的归一化比值
+                    if ey_ratio > 0.25:
+                        # |ey| 较大时用更小的 ay_eff 使 alpha 更敏感
+                        scale = 0.25 / max(ey_ratio, 0.01)
+                        ay_eff = s["ay"] * max(scale, 0.15)
+                    else:
+                        ay_eff = s["ay"]
+                    alpha = math.atan(ey / ay_eff) if ay_eff != 0 else 0.0
                     alpha = clamp(alpha, -s["alpha_max"], s["alpha_max"])
                     # 推进速度标量（可按误差适度减小速度，先对准再推进）
                     # 简单做法：误差越大，速度越小
@@ -1451,6 +1549,19 @@ class BodyCommMavlink(object):
                         vx = vy = vz = yawrate = 0.0
 
                     cmd = (vx, vy, vz, yawrate)
+
+            # ---------------- 高度天花板保护 ----------------
+            # 直接检查当前高度，防止 approach 循环中持续上升飞出地图
+            _ceiling_ned = float(self._safety_cfg.get("alt_ceiling_ned", -10.0))
+            _cur_alt_ned = float(self.MavList[0].uavPosNED[2])
+            if _cur_alt_ned <= _ceiling_ned:
+                # 已到达或超过天花板，禁止继续上升（FRD 中 vz<0 = 上升）
+                cmd_vx, cmd_vy, cmd_vz, cmd_yr = cmd
+                if cmd_vz < 0:
+                    cmd = (cmd_vx, cmd_vy, 0.0, cmd_yr)
+                    self.logger.warning(
+                        f"approach_ceiling_clamp alt={_cur_alt_ned:.2f} ceiling={_ceiling_ned:.2f} vz clamped to 0"
+                    )
 
             # ---------------- 末级下发（节流+轻微平滑） ----------------
             if t >= s["next_ok_ts"]:
@@ -1617,7 +1728,7 @@ class BodyCommMavlink(object):
             self.logger.debug(traceback.format_exc())
             return False
 
-    def approach_objective_to_target(self, object_names, max_seconds=60.0, align_tol=80.0, stable_need=3, box_ratio=1.0/5.0):
+    def approach_objective_to_target(self, object_names, max_seconds=60.0, align_tol=80.0, stable_need=3, box_ratio=1.0/5.0, spatial_hint=""):
         """
         靠近目标：先搜索目标，再循环检测并逼近，直到达到停止条件。
         """
@@ -1639,6 +1750,21 @@ class BodyCommMavlink(object):
             start_ts = time.monotonic()
             stable_cnt = 0
 
+            # --- 多目标稳定选择 (方案D: Center-First + Bbox Tracker + Spatial Hint) ---
+            _locked_center = None      # 上一帧锁定的 bbox 中心 (cx, cy)
+            _lock_lost_frames = 0      # 连续丢帧计数
+            _LOCK_LOST_THRESHOLD = 5   # 连续丢帧超过此值则重置锁定
+
+            # 解析空间提示词
+            _spatial = ""
+            hint = (spatial_hint or "").lower()
+            if "左" in hint or "left" in hint:
+                _spatial = "left"
+            elif "右" in hint or "right" in hint:
+                _spatial = "right"
+            if _spatial:
+                self.logger.info(f"approach_target spatial_hint='{_spatial}' from '{spatial_hint}'")
+
             while True:
                 if callable(self._interrupt_check) and self._interrupt_check():
                     self.logger.warning(f"approach_objective_to_target 被上层急停中断: {canonical_name}")
@@ -1656,20 +1782,70 @@ class BodyCommMavlink(object):
 
                 obj_list, obj_locs, obj_logits, img_with_box = self.detect_yolo(canonical_name)
                 if not obj_list or not obj_locs:
-                    stable_cnt = 0
+                    # 允许一定程度的闪烁，不要立刻清零，而是递减
+                    stable_cnt = max(0, stable_cnt - 1)
+                    _lock_lost_frames += 1
+                    if _lock_lost_frames >= _LOCK_LOST_THRESHOLD:
+                        _locked_center = None  # 连续丢帧，重置锁定
                     self.logger.warning(f"approach_objective_to_target丢失目标: {canonical_name}")
                     self.MavList[0].SendVelFRD(0, 0, 0, 0)
                     time.sleep(0.08)
                     continue
 
-                bbox = obj_locs[0]
+                img_w, img_h = img_with_box.size if hasattr(img_with_box, "size") else (640, 480)
+
+                # --- 多目标目标选择 ---
+                if len(obj_locs) == 1:
+                    best_idx = 0
+                elif _locked_center is not None:
+                    # 跟踪模式：选与上帧锁定中心最近的 bbox
+                    def _bbox_dist_to_lock(i):
+                        bb = obj_locs[i]
+                        if len(bb) < 4:
+                            return float('inf')
+                        cx = (bb[0] + bb[2]) / 2.0
+                        cy = (bb[1] + bb[3]) / 2.0
+                        return (cx - _locked_center[0])**2 + (cy - _locked_center[1])**2
+                    best_idx = min(range(len(obj_locs)), key=_bbox_dist_to_lock)
+                else:
+                    # 首次锁定：根据空间提示词或画面中心选择
+                    if _spatial == "left":
+                        # 选画面中 x 坐标最小（最左）的 bbox
+                        def _bbox_x_key(i):
+                            bb = obj_locs[i]
+                            return (bb[0] + bb[2]) / 2.0 if len(bb) >= 4 else float('inf')
+                        best_idx = min(range(len(obj_locs)), key=_bbox_x_key)
+                        self.logger.info(f"spatial_select='left' picked idx={best_idx} cx={_bbox_x_key(best_idx):.0f}")
+                    elif _spatial == "right":
+                        # 选画面中 x 坐标最大（最右）的 bbox
+                        def _bbox_x_key_r(i):
+                            bb = obj_locs[i]
+                            return (bb[0] + bb[2]) / 2.0 if len(bb) >= 4 else float('-inf')
+                        best_idx = max(range(len(obj_locs)), key=_bbox_x_key_r)
+                        self.logger.info(f"spatial_select='right' picked idx={best_idx} cx={_bbox_x_key_r(best_idx):.0f}")
+                    else:
+                        # 无空间提示：选最靠近画面中心的 bbox
+                        cx_img = img_w / 2.0
+                        cy_img = img_h / 2.0
+                        def _bbox_dist_to_center(i):
+                            bb = obj_locs[i]
+                            if len(bb) < 4:
+                                return float('inf')
+                            cx = (bb[0] + bb[2]) / 2.0
+                            cy = (bb[1] + bb[3]) / 2.0
+                            return (cx - cx_img)**2 + (cy - cy_img)**2
+                        best_idx = min(range(len(obj_locs)), key=_bbox_dist_to_center)
+
+                bbox = obj_locs[best_idx]
                 if len(bbox) < 4:
-                    stable_cnt = 0
+                    stable_cnt = max(0, stable_cnt - 1)
                     self.MavList[0].SendVelFRD(0, 0, 0, 0)
                     time.sleep(0.08)
                     continue
 
-                img_w, img_h = img_with_box.size if hasattr(img_with_box, "size") else (640, 480)
+                # 更新锁定状态
+                _locked_center = ((bbox[0]+bbox[2])/2.0, (bbox[1]+bbox[3])/2.0)
+                _lock_lost_frames = 0
                 center_x = (bbox[0] + bbox[2]) / 2.0
                 center_y = (bbox[1] + bbox[3]) / 2.0
                 error_x = center_x - img_w / 2.0
@@ -1679,7 +1855,19 @@ class BodyCommMavlink(object):
                 box_max = max(box_w, box_h)
                 need_box = img_w * box_ratio
 
-                stop_now = (box_max >= need_box) and (abs(error_x) <= align_tol) and (abs(error_y) <= align_tol)
+                # 优化停止条件：
+                # 1) 目标 box 达到 need_box 的 85% 以上时强制停车（防止穿模）
+                #    原 1.1 倍太高——box 接近 need_box 时 error_x 已极不稳定(>200px)，
+                #    导致常规 stop 因 error 过大不触发，强制 stop 因 box 不够也不触发 → 穿模
+                # 2) 若 box 未到 85% 但已 >= need_box 且居中，正常停
+                force_threshold = need_box * 0.85
+                if box_max >= force_threshold:
+                    stop_now = True
+                    stable_cnt = stable_need  # 直接拉满稳定帧数，立刻刹车
+                    self.logger.warning(f"approach_target_loop: box_max({box_max:.1f}) >= 强制停止阈值({force_threshold:.1f})，防穿模紧急刹车")
+                else:
+                    stop_now = (box_max >= need_box * 0.6) and (abs(error_x) <= align_tol) and (abs(error_y) <= align_tol)
+
                 stable_cnt = stable_cnt + 1 if stop_now else 0
 
                 self.logger.info(
