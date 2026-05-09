@@ -66,16 +66,34 @@ class BodyCommMavlink(object):
             base_url="https://ark.cn-beijing.volces.com/api/v3 ",
         )
 
-        # 加载YOLOE模型
-        weights_path = os.path.join(os.path.dirname(__file__), "weights", "best.pt")
-        self.yolo_model = YOLOE(weights_path)
-        self.CONF_THRESHOLD = 0.25  # 置信度阈值
-        self.NMS_THRESHOLD = 0.45   # NMS阈值
+        # 加载YOLOE模型（根据Config.json配置选择闭集/开放词汇模式）
+        yoloe_cfg = self._runtime_cfg.get("yoloe_config", {})
+        self._yoloe_mode = yoloe_cfg.get("mode", "closed_set")
+        weights_dir = os.path.join(os.path.dirname(__file__), "weights")
+
+        if self._yoloe_mode == "open_vocab":
+            # 开放词汇模式：加载预训练权重 + 文本提示
+            ov_weights = yoloe_cfg.get("open_vocab_weights", "yoloe-11s-seg.pt")
+            weights_path = os.path.join(weights_dir, ov_weights)
+            self.yolo_model = YOLOE(weights_path)
+            # 使用官方API set_classes() 设定开放词汇（仅需调用一次）
+            default_vocab = yoloe_cfg.get("default_vocab",
+                                          ["red balloon", "blue ball", "car", "drone", "person"])
+            self.yolo_model.set_classes(default_vocab)
+            self.logger.info(f"YOLOE开放词汇模式加载完成, weights={ov_weights}, vocab={default_vocab}")
+        else:
+            # 闭集模式：加载自定义训练权重
+            cs_weights = yoloe_cfg.get("closed_set_weights", "best.pt")
+            weights_path = os.path.join(weights_dir, cs_weights)
+            self.yolo_model = YOLOE(weights_path)
+            self.logger.info(f"YOLOE闭集模式加载完成, weights={cs_weights}")
+
+        self.CONF_THRESHOLD = yoloe_cfg.get("conf_threshold", 0.25)
+        self.NMS_THRESHOLD = yoloe_cfg.get("nms_threshold", 0.45)
         self.last_detection_image = None
         self.last_detection_time = None
         self.last_detection_has_object = False
         self.last_search_result_cn = "暂无搜索结果"
-        self.logger.info("YOLOE模型加载完成")
 
         # 最低硬约束：仿真和实飞默认一致开启
         self._safety_cfg = {

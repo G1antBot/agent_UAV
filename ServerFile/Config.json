@@ -14,6 +14,14 @@
             "稍微": 0.2
         }
     },
+    "yoloe_config": {
+        "mode": "open_vocab",  // 检测模式: closed_set(闭集,用best.pt训练权重) / open_vocab(开放词汇,用预训练权重+文本提示)
+        "closed_set_weights": "best.pt",      // 闭集模式权重文件名(相对weights目录)
+        "open_vocab_weights": "yoloe-11s-seg.pt", // 开放词汇模式权重文件名(首次使用会自动下载)
+        "default_vocab": ["red balloon", "blue ball", "car", "drone", "person"], // 开放词汇默认检测类别
+        "conf_threshold": 0.25,
+        "nms_threshold": 0.45
+    },
     "mocap": {
         "enabled": true,
         "multicast_ip": "239.255.42.99",
